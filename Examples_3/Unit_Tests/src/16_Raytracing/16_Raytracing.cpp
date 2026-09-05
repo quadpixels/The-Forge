@@ -55,7 +55,7 @@
 #define NO_FSL_DEFINITIONS
 #include "../../../../Common_3/Graphics/FSL/defaults.h"
 #include "Shaders/FSL/Shared.fsl.h"
-#include "Shaders/FSL/Global.srt.h"
+#include "Shaders/FSL/Global_wavefront.srt.h"
 
 #include "../../../../Common_3/Utilities/Interfaces/IMemory.h"
 
@@ -73,7 +73,8 @@ ProfileToken gGpuProfileToken;
 enum RaytracingTechnique
 {
     RAY_QUERY = 0,
-    // #NOTE: Extend enum when you add new raytracing technique
+    WAVEFRONT_PATH_TRACING,
+    PERSISTENT_WAVE_PATH_TRACING,
     RAYTRACING_TECHNIQUE_COUNT
 };
 uint32_t gRaytracingTechnique = RAY_QUERY;
@@ -176,6 +177,8 @@ public:
         /************************************************************************/
         initRaytracing(pRenderer, &pRaytracing);
         gRaytracingTechniqueSupported[RAY_QUERY] = pRenderer->pGpu->mRayQuerySupported;
+        gRaytracingTechniqueSupported[WAVEFRONT_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
+        gRaytracingTechniqueSupported[PERSISTENT_WAVE_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
 
         gUseUavRwFallback = !(pRenderer->pGpu->mFormatCaps[TinyImageFormat_R16G16B16A16_SFLOAT] & FORMAT_CAP_READ_WRITE);
 
@@ -471,7 +474,11 @@ public:
             guiDesc.mStartPosition = vec2(mSettings.mWidth * 0.01f, mSettings.mHeight * 0.2f);
             uiAddComponent(GetName(), &guiDesc, &pGuiWindow);
 
-            static const char* raytracingOptions[] = { "Ray Query" };
+            static const char* raytracingOptions[] = {
+                "Ray Query (MegaKernel)",
+                "Wavefront Path Tracing",
+                "Persistent Wave Path Tracing",
+            };
             COMPILE_ASSERT(TF_ARRAY_COUNT(raytracingOptions) == RAYTRACING_TECHNIQUE_COUNT);
             if (RAYTRACING_TECHNIQUE_COUNT > 1)
             {
@@ -575,6 +582,53 @@ public:
                 loadDesc.ppTexture = &pComputeOutput;
                 addResource(&loadDesc, NULL);
 
+                // Experimental path scheduling resources.
+                // These are resolution-dependent, so create them together with the output UAV.
+                const uint32_t pixelCount = mSettings.mWidth * mSettings.mHeight;
+
+                BufferLoadDesc pathStateDesc = {};
+                pathStateDesc.mDesc.mDescriptors = DESCRIPTOR_TYPE_RW_BUFFER;
+                pathStateDesc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                pathStateDesc.mDesc.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+                pathStateDesc.mDesc.mElementCount = pixelCount * 5; // 5 float4 values / path
+                // RWBuffer(float4) is a TYPED buffer view, not a structured view.
+                pathStateDesc.mDesc.mFormat = TinyImageFormat_R32G32B32A32_SFLOAT;
+                pathStateDesc.mDesc.mStructStride = 0;
+                pathStateDesc.mDesc.mSize = uint64_t(pathStateDesc.mDesc.mElementCount) * sizeof(float4);
+                pathStateDesc.mDesc.pName = "WavefrontPathState";
+                pathStateDesc.ppBuffer = &pWavefrontPathState;
+                addResource(&pathStateDesc, NULL);
+
+                BufferLoadDesc queueDesc = {};
+                queueDesc.mDesc.mDescriptors = DESCRIPTOR_TYPE_RW_BUFFER;
+                queueDesc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                queueDesc.mDesc.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+                queueDesc.mDesc.mElementCount = pixelCount;
+                // RWBuffer(uint) is also a TYPED buffer view.
+                queueDesc.mDesc.mFormat = TinyImageFormat_R32_UINT;
+                queueDesc.mDesc.mStructStride = 0;
+                queueDesc.mDesc.mSize = uint64_t(pixelCount) * sizeof(uint32_t);
+
+                queueDesc.mDesc.pName = "WavefrontQueueA";
+                queueDesc.ppBuffer = &pWavefrontQueueA;
+                addResource(&queueDesc, NULL);
+
+                queueDesc.mDesc.pName = "WavefrontQueueB";
+                queueDesc.ppBuffer = &pWavefrontQueueB;
+                addResource(&queueDesc, NULL);
+
+                BufferLoadDesc counterDesc = {};
+                counterDesc.mDesc.mDescriptors = DESCRIPTOR_TYPE_RW_BUFFER;
+                counterDesc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                counterDesc.mDesc.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+                counterDesc.mDesc.mElementCount = 4;
+                counterDesc.mDesc.mFormat = TinyImageFormat_R32_UINT;
+                counterDesc.mDesc.mStructStride = 0;
+                counterDesc.mDesc.mSize = 4 * sizeof(uint32_t);
+                counterDesc.mDesc.pName = "WavefrontCounters";
+                counterDesc.ppBuffer = &pWavefrontCounters;
+                addResource(&counterDesc, NULL);
+
 #if USE_DENOISER
                 uavDesc.mFormat = TinyImageFormat_B10G10R10A2_UNORM;
                 loadDesc.ppTexture = &pAlbedoTexture;
@@ -646,6 +700,10 @@ public:
             if (pReloadDesc->mType & RELOAD_TYPE_RESIZE)
             {
                 removeResource(pComputeOutput);
+                removeResource(pWavefrontPathState);
+                removeResource(pWavefrontQueueA);
+                removeResource(pWavefrontQueueB);
+                removeResource(pWavefrontCounters);
 #if USE_DENOISER
                 removeResource(pAlbedoTexture);
 #endif
@@ -866,7 +924,8 @@ public:
             /************************************************************************/
             // Perform raytracing
             /************************************************************************/
-            cmdBindPipeline(pCmd, pPipeline[gRaytracingTechnique]);
+            if (RAY_QUERY == gRaytracingTechnique)
+                cmdBindPipeline(pCmd, pPipeline[RAY_QUERY]);
 
             cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
             cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
@@ -878,6 +937,55 @@ public:
                 uint32_t        groupX = round_up(mSettings.mWidth, numThreads[0]) / numThreads[0];
                 uint32_t        groupY = round_up(mSettings.mHeight, numThreads[1]) / numThreads[1];
                 cmdDispatch(pCmd, groupX, groupY, 1);
+            }
+            else if (WAVEFRONT_PATH_TRACING == gRaytracingTechnique)
+            {
+                const uint32_t pixelCount = mSettings.mWidth * mSettings.mHeight;
+                const uint32_t threads = pShaderWavefrontGenerate->mNumThreadsPerGroup[0];
+                const uint32_t groups = round_up(pixelCount, threads) / threads;
+
+                BufferBarrier uavSync[] = {
+                    { pWavefrontPathState, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS },
+                    { pWavefrontQueueA, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS },
+                    { pWavefrontQueueB, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS },
+                    { pWavefrontCounters, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS },
+                };
+
+                cmdBindPipeline(pCmd, pPipelineWavefrontGenerate);
+                cmdDispatch(pCmd, groups, 1, 1);
+                cmdResourceBarrier(pCmd, TF_ARRAY_COUNT(uavSync), uavSync, 0, NULL, 0, NULL);
+
+                // Correctness-first wavefront implementation:
+                // dispatch the maximum path count and let the shader early-out against queueCount.
+                // Once this is verified, this is the exact spot to switch to DispatchIndirect.
+                cmdBindPipeline(pCmd, pPipelineWavefrontBounce0);
+                cmdDispatch(pCmd, groups, 1, 1);
+                cmdResourceBarrier(pCmd, TF_ARRAY_COUNT(uavSync), uavSync, 0, NULL, 0, NULL);
+
+                cmdBindPipeline(pCmd, pPipelineWavefrontBounce1);
+                cmdDispatch(pCmd, groups, 1, 1);
+                cmdResourceBarrier(pCmd, TF_ARRAY_COUNT(uavSync), uavSync, 0, NULL, 0, NULL);
+
+                cmdBindPipeline(pCmd, pPipelineWavefrontResolve);
+                cmdDispatch(pCmd, groups, 1, 1);
+            }
+            else if (PERSISTENT_WAVE_PATH_TRACING == gRaytracingTechnique)
+            {
+                BufferBarrier counterSync = { pWavefrontCounters, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS };
+
+                cmdBindPipeline(pCmd, pPipelinePersistentReset);
+                cmdDispatch(pCmd, 1, 1, 1);
+                cmdResourceBarrier(pCmd, 1, &counterSync, 0, NULL, 0, NULL);
+
+                // Deliberately bounded number of groups: these groups persist and repeatedly
+                // dequeue wave-sized chunks of pixels until the global queue is exhausted.
+                const uint32_t pixelCount = mSettings.mWidth * mSettings.mHeight;
+                const uint32_t threads = pShaderPersistentWave->mNumThreadsPerGroup[0];
+                const uint32_t normalGroups = round_up(pixelCount, threads) / threads;
+                const uint32_t persistentGroups = min(256u, normalGroups);
+
+                cmdBindPipeline(pCmd, pPipelinePersistentWave);
+                cmdDispatch(pCmd, persistentGroups, 1, 1);
             }
             /************************************************************************/
             // Transition UAV to be used as source and swapchain as destination in copy operation
@@ -1055,6 +1163,30 @@ public:
             desc.mComp.pFileName = USE_DENOISER ? (gUseUavRwFallback ? "RayQuery_denoise_rw_fallback.comp" : "RayQuery_denoise.comp")
                                                 : (gUseUavRwFallback ? "RayQuery_rw_fallback.comp" : "RayQuery.comp");
             addShader(pRenderer, &desc, &pShaderRayQuery);
+
+            ShaderLoadDesc wfGen = {};
+            wfGen.mComp.pFileName = "RayQueryWavefrontGenerate.comp";
+            addShader(pRenderer, &wfGen, &pShaderWavefrontGenerate);
+
+            ShaderLoadDesc wfBounce0 = {};
+            wfBounce0.mComp.pFileName = "RayQueryWavefrontBounce0.comp";
+            addShader(pRenderer, &wfBounce0, &pShaderWavefrontBounce0);
+
+            ShaderLoadDesc wfBounce1 = {};
+            wfBounce1.mComp.pFileName = "RayQueryWavefrontBounce1.comp";
+            addShader(pRenderer, &wfBounce1, &pShaderWavefrontBounce1);
+
+            ShaderLoadDesc wfResolve = {};
+            wfResolve.mComp.pFileName = "RayQueryWavefrontResolve.comp";
+            addShader(pRenderer, &wfResolve, &pShaderWavefrontResolve);
+
+            ShaderLoadDesc persistentReset = {};
+            persistentReset.mComp.pFileName = "RayQueryPersistentReset.comp";
+            addShader(pRenderer, &persistentReset, &pShaderPersistentReset);
+
+            ShaderLoadDesc persistentWave = {};
+            persistentWave.mComp.pFileName = "RayQueryPersistentWave.comp";
+            addShader(pRenderer, &persistentWave, &pShaderPersistentWave);
         }
 
 #if USE_DENOISER
@@ -1087,6 +1219,12 @@ public:
         if (gRaytracingTechniqueSupported[RAY_QUERY])
         {
             removeShader(pRenderer, pShaderRayQuery);
+            removeShader(pRenderer, pShaderWavefrontGenerate);
+            removeShader(pRenderer, pShaderWavefrontBounce0);
+            removeShader(pRenderer, pShaderWavefrontBounce1);
+            removeShader(pRenderer, pShaderWavefrontResolve);
+            removeShader(pRenderer, pShaderPersistentReset);
+            removeShader(pRenderer, pShaderPersistentWave);
         }
     }
 
@@ -1104,6 +1242,23 @@ public:
             ComputePipelineDesc& pipelineDesc = rtPipelineDesc.mComputeDesc;
             pipelineDesc.pShaderProgram = pShaderRayQuery;
             addPipeline(pRenderer, &rtPipelineDesc, &pPipeline[RAY_QUERY]);
+
+            auto addExperimentalComputePipeline = [&](Shader* pShader, Pipeline** ppPipeline)
+            {
+                PipelineDesc desc = {};
+                desc.mType = PIPELINE_TYPE_COMPUTE;
+                PIPELINE_LAYOUT_DESC(desc, SRT_LAYOUT_DESC(SrtData, Persistent), SRT_LAYOUT_DESC(SrtData, PerFrame),
+                                     SRT_LAYOUT_DESC(SrtData, PerBatch), NULL);
+                desc.mComputeDesc.pShaderProgram = pShader;
+                addPipeline(pRenderer, &desc, ppPipeline);
+            };
+
+            addExperimentalComputePipeline(pShaderWavefrontGenerate, &pPipelineWavefrontGenerate);
+            addExperimentalComputePipeline(pShaderWavefrontBounce0, &pPipelineWavefrontBounce0);
+            addExperimentalComputePipeline(pShaderWavefrontBounce1, &pPipelineWavefrontBounce1);
+            addExperimentalComputePipeline(pShaderWavefrontResolve, &pPipelineWavefrontResolve);
+            addExperimentalComputePipeline(pShaderPersistentReset, &pPipelinePersistentReset);
+            addExperimentalComputePipeline(pShaderPersistentWave, &pPipelinePersistentWave);
 
 #if defined(SHADER_STATS_AVAILABLE)
             {
@@ -1201,13 +1356,20 @@ public:
 #endif
         for (uint32_t t = 0; t < RAYTRACING_TECHNIQUE_COUNT; ++t)
         {
-            removePipeline(pRenderer, pPipeline[t]);
+            if (pPipeline[t])
+                removePipeline(pRenderer, pPipeline[t]);
         }
+        removePipeline(pRenderer, pPipelineWavefrontGenerate);
+        removePipeline(pRenderer, pPipelineWavefrontBounce0);
+        removePipeline(pRenderer, pPipelineWavefrontBounce1);
+        removePipeline(pRenderer, pPipelineWavefrontResolve);
+        removePipeline(pRenderer, pPipelinePersistentReset);
+        removePipeline(pRenderer, pPipelinePersistentWave);
     }
 
     void prepareDescriptorSets()
     {
-        DescriptorData perFrameParams[7] = {};
+        DescriptorData perFrameParams[11] = {};
         DescriptorData perBatchParams[5] = {};
 
         perFrameParams[0].mIndex = SRT_RES_IDX(SrtData, Persistent, gRtScene);
@@ -1225,6 +1387,15 @@ public:
         perFrameParams[6].mIndex = SRT_RES_IDX(SrtData, Persistent, gMaterialTextures);
         perFrameParams[6].ppTextures = SanMiguelProp.pTextureStorage;
         perFrameParams[6].mCount = SanMiguelProp.mMaterialCount;
+
+        perFrameParams[7].mIndex = SRT_RES_IDX(SrtData, Persistent, gWavefrontPathState);
+        perFrameParams[7].ppBuffers = &pWavefrontPathState;
+        perFrameParams[8].mIndex = SRT_RES_IDX(SrtData, Persistent, gWavefrontQueueA);
+        perFrameParams[8].ppBuffers = &pWavefrontQueueA;
+        perFrameParams[9].mIndex = SRT_RES_IDX(SrtData, Persistent, gWavefrontQueueB);
+        perFrameParams[9].ppBuffers = &pWavefrontQueueB;
+        perFrameParams[10].mIndex = SRT_RES_IDX(SrtData, Persistent, gWavefrontCounters);
+        perFrameParams[10].ppBuffers = &pWavefrontCounters;
 
         perBatchParams[0].mIndex = SRT_RES_IDX(SrtData, PerBatch, gOutput);
         perBatchParams[0].ppTextures = &pComputeOutput;
@@ -1249,7 +1420,7 @@ public:
 #endif
         for (uint32_t t = 0; t < RAYTRACING_TECHNIQUE_COUNT; ++t)
         {
-            updateDescriptorSet(pRenderer, 0, pDescriptorSetRaytracing[t], 7, perFrameParams);
+            updateDescriptorSet(pRenderer, 0, pDescriptorSetRaytracing[t], 11, perFrameParams);
             updateDescriptorSet(pRenderer, 0, pDescriptorSetRaytracingPerBatch[t], paramIndex, perBatchParams);
 
             for (uint32_t i = 0; i < gDataBufferCount; ++i)
@@ -1308,15 +1479,31 @@ private:
     AccelerationStructure* pSanMiguelBottomAS = NULL;
     AccelerationStructure* pSanMiguelAS = NULL;
     Shader*                pShaderRayQuery = NULL;
+    Shader*                pShaderWavefrontGenerate = NULL;
+    Shader*                pShaderWavefrontBounce0 = NULL;
+    Shader*                pShaderWavefrontBounce1 = NULL;
+    Shader*                pShaderWavefrontResolve = NULL;
+    Shader*                pShaderPersistentReset = NULL;
+    Shader*                pShaderPersistentWave = NULL;
     Shader*                pDisplayTextureShader = NULL;
     DescriptorSet*         pDescriptorSetRaytracing[RAYTRACING_TECHNIQUE_COUNT] = {};
     DescriptorSet*         pDescriptorSetRaytracingPerBatch[RAYTRACING_TECHNIQUE_COUNT] = {};
     DescriptorSet*         pDescriptorSetUniforms[RAYTRACING_TECHNIQUE_COUNT] = {};
     DescriptorSet*         pDescriptorSetTexture = NULL;
     Pipeline*              pPipeline[RAYTRACING_TECHNIQUE_COUNT] = {};
+    Pipeline*              pPipelineWavefrontGenerate = NULL;
+    Pipeline*              pPipelineWavefrontBounce0 = NULL;
+    Pipeline*              pPipelineWavefrontBounce1 = NULL;
+    Pipeline*              pPipelineWavefrontResolve = NULL;
+    Pipeline*              pPipelinePersistentReset = NULL;
+    Pipeline*              pPipelinePersistentWave = NULL;
     Pipeline*              pDisplayTexturePipeline = NULL;
     SwapChain*             pSwapChain = NULL;
     Texture*               pComputeOutput = NULL;
+    Buffer*                pWavefrontPathState = NULL;
+    Buffer*                pWavefrontQueueA = NULL;
+    Buffer*                pWavefrontQueueB = NULL;
+    Buffer*                pWavefrontCounters = NULL;
     Semaphore*             pImageAcquiredSemaphore = NULL;
     uint32_t               mFrameIdx = 0;
     PathTracingData        mPathTracingData = {};

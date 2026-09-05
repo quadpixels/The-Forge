@@ -1,0 +1,31 @@
+#include "RayQuerySchedulingCommon.fsl"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(64, 1, 1)
+void CS_MAIN(SV_DispatchThreadID(uint) tid)
+{
+    INIT_MAIN;
+
+    uint pixelCount = gSettings.mWidth * gSettings.mHeight;
+
+    if (tid < pixelCount)
+    {
+        RayDesc ray;
+        float3 throughput;
+        float3 radiance;
+        float3 primaryAlbedo;
+        uint bounce;
+        uint pixelIndex;
+        float active;
+
+        LoadPath(tid, ray, throughput, bounce, radiance, pixelIndex, primaryAlbedo, active);
+
+        uint2 pixel = uint2(
+            pixelIndex % gSettings.mWidth,
+            pixelIndex / gSettings.mWidth);
+
+        AccumulateOutput(pixel, radiance, primaryAlbedo);
+    }
+
+    RETURN();
+}

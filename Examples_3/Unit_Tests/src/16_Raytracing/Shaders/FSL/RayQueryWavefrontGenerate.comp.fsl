@@ -1,0 +1,28 @@
+#include "RayQuerySchedulingCommon.fsl"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(64, 1, 1)
+void CS_MAIN(SV_DispatchThreadID(uint) tid)
+{
+    INIT_MAIN;
+
+    uint pixelCount = gSettings.mWidth * gSettings.mHeight;
+
+    if (tid == 0)
+    {
+        gWavefrontCounters[0] = pixelCount;
+        gWavefrontCounters[1] = 0;
+    }
+
+    // FSL RETURN() must be the final statement of the entry point.
+    // Therefore use an outer guard instead of an early RETURN().
+    if (tid < pixelCount)
+    {
+        uint2 pixel = uint2(tid % gSettings.mWidth, tid / gSettings.mWidth);
+        RayDesc ray = GenerateCameraRay(pixel);
+        StorePath(tid, ray, f3(1.0f), 0, f3(0.0f), tid, f3(0.0f), 1.0f);
+        gWavefrontQueueA[tid] = tid;
+    }
+
+    RETURN();
+}

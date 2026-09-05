@@ -1,0 +1,9 @@
+#include "RayQuerySchedulingCommon.fsl"
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(1, 1, 1)
+void CS_MAIN(SV_DispatchThreadID(uint) tid)
+{
+    INIT_MAIN;
+    gWavefrontCounters[2] = 0;
+    RETURN();
+}

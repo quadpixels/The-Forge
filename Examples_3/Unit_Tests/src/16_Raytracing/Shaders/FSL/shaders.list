@@ -57,3 +57,27 @@
 #define DENOISER_ENABLED 1
 #include "RayQuery.comp.fsl"
 #end
+
+#comp FT_RAYTRACING RayQueryWavefrontResolve.comp
+#include "RayQueryWavefrontResolve.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryPersistentReset.comp
+#include "RayQueryPersistentReset.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryPersistentWave.comp
+#include "RayQueryPersistentWave.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryWavefrontBounce0.comp
+#include "RayQueryWavefrontBounce0.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryWavefrontBounce1.comp
+#include "RayQueryWavefrontBounce1.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryWavefrontGenerate.comp
+#include "RayQueryWavefrontGenerate.comp.fsl"
+#end
