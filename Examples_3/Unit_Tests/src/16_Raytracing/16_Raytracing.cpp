@@ -38,6 +38,7 @@
 #include "../../../../Common_3/Utilities/Interfaces/IFileSystem.h"
 #include "../../../../Common_3/Utilities/Interfaces/ILog.h"
 #include "../../../../Common_3/Utilities/Interfaces/ITime.h"
+#include "../../../../Common_3/Application/ThirdParty/OpenSource/imgui/imgui.h"
 
 #include "../../../../Common_3/Utilities/RingBuffer.h"
 
@@ -66,6 +67,36 @@
 
 bool gUseUavRwFallback = false;
 
+// Optional D3D12 profiling aid. Disabled by default.
+// SetStablePowerState generally requires Windows Developer Mode.
+bool gStablePowerState = false;
+
+static bool setStablePowerState(Renderer* pRenderer, bool enable)
+{
+#if defined(DIRECT3D12) && defined(_WINDOWS)
+    if (!pRenderer || !pRenderer->mDx.pDevice)
+        return false;
+
+    const HRESULT hr = pRenderer->mDx.pDevice->SetStablePowerState(enable ? TRUE : FALSE);
+    if (FAILED(hr))
+    {
+        LOGF(eERROR,
+             "ID3D12Device::SetStablePowerState(%s) failed: HRESULT=0x%08X. "
+             "Windows Developer Mode may need to be enabled.",
+             enable ? "TRUE" : "FALSE", (uint32_t)hr);
+        return false;
+    }
+
+    LOGF(eINFO, "D3D12 stable power state: %s", enable ? "enabled" : "disabled");
+    return true;
+#else
+    UNREF_PARAM(pRenderer);
+    UNREF_PARAM(enable);
+    LOGF(eWARNING, "Stable power state is only implemented for D3D12 on Windows in this sample.");
+    return false;
+#endif
+}
+
 ICameraController* pCameraController = NULL;
 
 ProfileToken gGpuProfileToken;
@@ -74,11 +105,75 @@ enum RaytracingTechnique
 {
     RAY_QUERY = 0,
     WAVEFRONT_PATH_TRACING,
-    PERSISTENT_WAVE_PATH_TRACING,
+    WAVEFRONT_V2_PATH_TRACING,
+    PERSISTENT_WAVE_256_PATH_TRACING,
+    PERSISTENT_WAVE_128_PATH_TRACING,
+    PERSISTENT_WAVE_64_PATH_TRACING,
+    PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING,
     RAYTRACING_TECHNIQUE_COUNT
 };
 uint32_t gRaytracingTechnique = RAY_QUERY;
 bool     gRaytracingTechniqueSupported[RAYTRACING_TECHNIQUE_COUNT] = {};
+
+// Persistent scheduler tuning. 2 means 64 resident groups by default.
+uint32_t              gPersistentGroupPreset = 2;
+static const uint32_t gPersistentGroupCounts[] = { 16, 32, 64, 128, 256, 512 };
+
+uint32_t              gPersistentSchedulingMode = 0; // 0 = dynamic batch dequeue, 1 = static grid-stride
+uint32_t              gPersistentBatchPreset = 0;    // default batch = 1 (previous behavior)
+static const uint32_t gPersistentBatchSizes[] = { 1, 2, 4, 8 };
+
+uint32_t              gPersistentWavefrontGroupPreset = 1; // 0 = TG64, 1 = TG128, 2 = TG256
+static const uint32_t gPersistentWavefrontGroupSizes[] = { 64, 128, 256 };
+
+uint32_t              gMaxBouncePreset = 1; // default = 2 bounces
+static const uint32_t gMaxBounceValues[] = { 1, 2, 3, 4, 6, 8 };
+
+static char    gRaytracingBenchmarkResultsStorage[64 * 1024] = {};
+static char    gRaytracingBenchmarkTableStorage[64 * 1024] = {};
+static char    gRaytracingBenchmarkProgressStorage[512] = {};
+static bstring gRaytracingBenchmarkResults = bemptyfromarr(gRaytracingBenchmarkResultsStorage);
+static bstring gRaytracingBenchmarkTable = bemptyfromarr(gRaytracingBenchmarkTableStorage);
+static bstring gRaytracingBenchmarkProgress = bemptyfromarr(gRaytracingBenchmarkProgressStorage);
+static float4 gRaytracingBenchmarkTextColor = float4(1.f, 1.f, 1.f, 1.f);
+
+struct RaytracingPreset
+{
+    uint32_t mTechnique;
+    uint32_t mBouncePreset;
+    uint32_t mPersistentGroupPreset;
+    uint32_t mPersistentSchedulingMode;
+    uint32_t mPersistentBatchPreset;
+};
+
+static const RaytracingPreset gRaytracingPresets[] = {
+    { RAY_QUERY, 1, 2, 0, 0 },                                  // RayQuery, 2 bounces
+    { WAVEFRONT_V2_PATH_TRACING, 1, 2, 0, 0 },                   // Wavefront V2, 2 bounces
+    { PERSISTENT_WAVE_256_PATH_TRACING, 1, 5, 0, 0 },            // Persistent warp TG256x512, 2 bounces
+    { PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING, 1, 5, 0, 0 }, // Persistent WaveFront TG128x512, 2 bounces
+    { RAY_QUERY, 5, 2, 0, 0 },                                  // RayQuery, 8 bounces
+    { WAVEFRONT_V2_PATH_TRACING, 5, 2, 0, 0 },                  // Wavefront V2, 8 bounces
+    { PERSISTENT_WAVE_256_PATH_TRACING, 5, 5, 0, 0 },            // Persistent warp TG256x512, 8 bounces
+    { PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING, 5, 5, 0, 0 }, // Persistent WaveFront TG128x512, 8 bounces
+};
+
+static void applyRaytracingPreset(void* pUserData)
+{
+    const RaytracingPreset* pPreset = (const RaytracingPreset*)pUserData;
+    gRaytracingTechnique = pPreset->mTechnique;
+    gMaxBouncePreset = pPreset->mBouncePreset;
+    gPersistentGroupPreset = pPreset->mPersistentGroupPreset;
+    gPersistentSchedulingMode = pPreset->mPersistentSchedulingMode;
+    gPersistentBatchPreset = pPreset->mPersistentBatchPreset;
+    if (pPreset->mTechnique == PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING)
+        gPersistentWavefrontGroupPreset = 1;
+    gStablePowerState = true;
+}
+
+class UnitTest_NativeRaytracing;
+static UnitTest_NativeRaytracing* gRaytracingApp = NULL;
+static void startRaytracingBenchmark(void* pUserData);
+static void saveRaytracingBenchmark(void* pUserData);
 
 struct PropData
 {
@@ -131,11 +226,238 @@ class UnitTest_NativeRaytracing: public IApp
 public:
     UnitTest_NativeRaytracing()
     {
+        gRaytracingApp = this;
 #ifdef TARGET_IOS
         mSettings.mContentScaleFactor = 1.f;
 #endif
         ReadCmdArgs();
     }
+
+    void startBenchmark()
+    {
+        if (mBenchmarkPhase != BENCHMARK_IDLE && mBenchmarkPhase != BENCHMARK_FINISHED)
+            return;
+
+        if (gRaytracingTechnique != WAVEFRONT_V2_PATH_TRACING &&
+            gRaytracingTechnique != PERSISTENT_WAVE_256_PATH_TRACING &&
+            gRaytracingTechnique != PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING)
+        {
+            mBenchmarkPhase = BENCHMARK_IDLE;
+            bassignliteral(&gRaytracingBenchmarkTable,
+                           "Select Wavefront V2, Persistent Wave, or Persistent Wavefront before starting a scan.\n");
+            updateBenchmarkResultsText();
+            return;
+        }
+
+        if (!gRaytracingTechniqueSupported[gRaytracingTechnique])
+        {
+            mBenchmarkPhase = BENCHMARK_IDLE;
+            bassignliteral(&gRaytracingBenchmarkTable, "The selected raytracing technique is not supported on this GPU.\n");
+            updateBenchmarkResultsText();
+            return;
+        }
+
+        mBenchmarkSavedTechnique = gRaytracingTechnique;
+        mBenchmarkSavedGroupPreset = gPersistentGroupPreset;
+        mBenchmarkSavedSchedulingMode = gPersistentSchedulingMode;
+        mBenchmarkSavedBatchPreset = gPersistentBatchPreset;
+        mBenchmarkSavedWavefrontGroupPreset = gPersistentWavefrontGroupPreset;
+        mBenchmarkConfigCount = 0;
+        mBenchmarkConfigIndex = 0;
+        gStablePowerState = true;
+        bassignliteral(&gRaytracingBenchmarkTable,
+                       "Technique,Thread Group Size,Thread Groups,Average GPU (ms)\n");
+
+        if (gRaytracingTechnique == WAVEFRONT_V2_PATH_TRACING)
+        {
+            // V2 currently has only the precompiled TG64 variant. Its dispatch count is
+            // derived from the image size, so it cannot be reduced safely for a scan.
+            mBenchmarkConfigs[mBenchmarkConfigCount++] = { WAVEFRONT_V2_PATH_TRACING, 64, UINT32_MAX };
+        }
+        else if (gRaytracingTechnique == PERSISTENT_WAVE_256_PATH_TRACING)
+        {
+            static const uint32_t threadGroupTechniques[] = {
+                PERSISTENT_WAVE_64_PATH_TRACING,
+                PERSISTENT_WAVE_128_PATH_TRACING,
+                PERSISTENT_WAVE_256_PATH_TRACING,
+            };
+            static const uint32_t threadGroupSizes[] = { 64, 128, 256 };
+            for (uint32_t techniqueIndex = 0; techniqueIndex < TF_ARRAY_COUNT(threadGroupTechniques); ++techniqueIndex)
+            {
+                const uint32_t technique = threadGroupTechniques[techniqueIndex];
+                for (uint32_t groupPreset = 0; groupPreset < TF_ARRAY_COUNT(gPersistentGroupCounts); ++groupPreset)
+                    mBenchmarkConfigs[mBenchmarkConfigCount++] = { technique, threadGroupSizes[techniqueIndex], groupPreset };
+            }
+        }
+        else
+        {
+            for (uint32_t threadGroupPreset = 0; threadGroupPreset < TF_ARRAY_COUNT(gPersistentWavefrontGroupSizes); ++threadGroupPreset)
+            {
+                for (uint32_t groupPreset = 0; groupPreset < TF_ARRAY_COUNT(gPersistentGroupCounts); ++groupPreset)
+                    mBenchmarkConfigs[mBenchmarkConfigCount++] = {
+                        PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING,
+                        gPersistentWavefrontGroupSizes[threadGroupPreset],
+                        groupPreset,
+                    };
+            }
+        }
+
+        prepareBenchmarkConfig();
+        updateBenchmarkResultsText();
+    }
+
+    void saveBenchmark()
+    {
+        ImGui::SetClipboardText((const char*)bdata(&gRaytracingBenchmarkResults));
+
+        FileStream stream = {};
+        if (fsOpenStreamFromPath(RD_OTHER_FILES, "RaytracingBenchmark.txt", FM_WRITE, &stream))
+        {
+            fsWriteToStream(&stream, bdata(&gRaytracingBenchmarkResults), (size_t)blength(&gRaytracingBenchmarkResults));
+            fsCloseStream(&stream);
+            LOGF(eINFO, "Copied benchmark results to clipboard and saved RaytracingBenchmark.txt");
+        }
+        else
+        {
+            LOGF(eERROR, "Copied benchmark results to clipboard, but failed to save RaytracingBenchmark.txt");
+        }
+    }
+
+private:
+    enum BenchmarkPhase
+    {
+        BENCHMARK_IDLE,
+        BENCHMARK_WARMUP,
+        BENCHMARK_SAMPLE,
+        BENCHMARK_FINISHED,
+    };
+
+    struct BenchmarkConfig
+    {
+        uint32_t mTechnique;
+        uint32_t mThreadGroupSize;
+        uint32_t mGroupPreset;
+    };
+
+    void updateBenchmarkResultsText()
+    {
+        char progress[256] = {};
+        if (mBenchmarkPhase == BENCHMARK_WARMUP || mBenchmarkPhase == BENCHMARK_SAMPLE)
+        {
+            const char* phase = mBenchmarkPhase == BENCHMARK_WARMUP ? "warmup" : "sample";
+            const uint32_t warmupFrames = mBenchmarkPhase == BENCHMARK_WARMUP ? mBenchmarkFrameCount : 20;
+            const uint32_t sampleFrames = mBenchmarkPhase == BENCHMARK_SAMPLE ? mBenchmarkFrameCount : 0;
+            const int64_t elapsedUsec = getUSec(false) - mBenchmarkStartUsec;
+            snprintf(progress, sizeof(progress), "Configuration %u/%u | %s | warmup=%u/20 (%.1f/5000 ms) | sample=%u/20",
+                     mBenchmarkConfigIndex + 1, mBenchmarkConfigCount, phase, warmupFrames,
+                     min((double)elapsedUsec / 1000.0, 5000.0), sampleFrames);
+        }
+        else if (mBenchmarkPhase == BENCHMARK_FINISHED)
+        {
+            strcpy(progress, "Complete");
+        }
+        else
+        {
+            strcpy(progress, "Idle");
+        }
+
+        bassigncstr(&gRaytracingBenchmarkProgress, progress);
+        bassign(&gRaytracingBenchmarkResults, &gRaytracingBenchmarkTable);
+    }
+
+    void prepareBenchmarkConfig()
+    {
+        const BenchmarkConfig& config = mBenchmarkConfigs[mBenchmarkConfigIndex];
+        gRaytracingTechnique = config.mTechnique;
+        if (config.mGroupPreset != UINT32_MAX)
+            gPersistentGroupPreset = config.mGroupPreset;
+        if (config.mTechnique == PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING)
+        {
+            for (uint32_t i = 0; i < TF_ARRAY_COUNT(gPersistentWavefrontGroupSizes); ++i)
+            {
+                if (gPersistentWavefrontGroupSizes[i] == config.mThreadGroupSize)
+                {
+                    gPersistentWavefrontGroupPreset = i;
+                    break;
+                }
+            }
+        }
+        mBenchmarkPhase = BENCHMARK_WARMUP;
+        mBenchmarkFrameCount = 0;
+        mBenchmarkGpuTimeSum = 0.0;
+        mBenchmarkStartUsec = getUSec(false);
+        mFrameIdx = 0;
+        mPathTracingData = {};
+        updateBenchmarkResultsText();
+    }
+
+    void processBenchmarkFrame()
+    {
+        if (mBenchmarkPhase == BENCHMARK_IDLE || mBenchmarkPhase == BENCHMARK_FINISHED)
+            return;
+
+        if (mBenchmarkPhase == BENCHMARK_WARMUP)
+        {
+            ++mBenchmarkFrameCount;
+            const bool warmupDone = mBenchmarkFrameCount >= 20 || getUSec(false) - mBenchmarkStartUsec >= 5000000;
+            if (warmupDone)
+            {
+                mBenchmarkPhase = BENCHMARK_SAMPLE;
+                mBenchmarkFrameCount = 0;
+                mBenchmarkGpuTimeSum = 0.0;
+            }
+            updateBenchmarkResultsText();
+            return;
+        }
+
+        const float gpuTimeMs = getGpuProfileTime(mRaytracingGpuProfileToken);
+        if (gpuTimeMs <= 0.0f)
+            return;
+
+        ++mBenchmarkFrameCount;
+        mBenchmarkGpuTimeSum += gpuTimeMs;
+        if (mBenchmarkFrameCount < 20)
+        {
+            updateBenchmarkResultsText();
+            return;
+        }
+
+        const BenchmarkConfig& config = mBenchmarkConfigs[mBenchmarkConfigIndex];
+        char resultLine[256] = {};
+        if (config.mGroupPreset == UINT32_MAX)
+        {
+            snprintf(resultLine, sizeof(resultLine), "Wavefront V2,%u,derived,%.3f\n",
+                     config.mThreadGroupSize, mBenchmarkGpuTimeSum / 20.0);
+        }
+        else
+        {
+            snprintf(resultLine, sizeof(resultLine), "%s,%u,%u,%.3f\n",
+                     config.mTechnique == PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING ? "Persistent Wavefront" : "Persistent Warp",
+                     config.mThreadGroupSize, gPersistentGroupCounts[config.mGroupPreset], mBenchmarkGpuTimeSum / 20.0);
+        }
+        bcatcstr(&gRaytracingBenchmarkTable, resultLine);
+
+        ++mBenchmarkConfigIndex;
+        if (mBenchmarkConfigIndex < mBenchmarkConfigCount)
+        {
+            prepareBenchmarkConfig();
+        }
+        else
+        {
+            gRaytracingTechnique = mBenchmarkSavedTechnique;
+            gPersistentGroupPreset = mBenchmarkSavedGroupPreset;
+            gPersistentSchedulingMode = mBenchmarkSavedSchedulingMode;
+            gPersistentBatchPreset = mBenchmarkSavedBatchPreset;
+            gPersistentWavefrontGroupPreset = mBenchmarkSavedWavefrontGroupPreset;
+            mBenchmarkPhase = BENCHMARK_FINISHED;
+            mFrameIdx = 0;
+            mPathTracingData = {};
+            bcatcstr(&gRaytracingBenchmarkTable, "\nBenchmark complete.\n");
+        }
+        updateBenchmarkResultsText();
+    }
+
+public:
 
     void ReadCmdArgs()
     {
@@ -178,9 +500,15 @@ public:
         initRaytracing(pRenderer, &pRaytracing);
         gRaytracingTechniqueSupported[RAY_QUERY] = pRenderer->pGpu->mRayQuerySupported;
         gRaytracingTechniqueSupported[WAVEFRONT_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
-        gRaytracingTechniqueSupported[PERSISTENT_WAVE_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
+        gRaytracingTechniqueSupported[WAVEFRONT_V2_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
+        gRaytracingTechniqueSupported[PERSISTENT_WAVE_256_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
+        gRaytracingTechniqueSupported[PERSISTENT_WAVE_128_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
+        gRaytracingTechniqueSupported[PERSISTENT_WAVE_64_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
+        gRaytracingTechniqueSupported[PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
 
         gUseUavRwFallback = !(pRenderer->pGpu->mFormatCaps[TinyImageFormat_R16G16B16A16_SFLOAT] & FORMAT_CAP_READ_WRITE);
+        for (uint32_t t = WAVEFRONT_PATH_TRACING; t < RAYTRACING_TECHNIQUE_COUNT; ++t)
+            gRaytracingTechniqueSupported[t] &= !gUseUavRwFallback;
 
         initResourceLoaderInterface(pRenderer);
 
@@ -455,6 +783,14 @@ public:
         exitQueue(pRenderer, pQueue);
         exitRootSignature(pRenderer);
         exitResourceLoaderInterface(pRenderer);
+
+        // Do not leave the device in stable-power mode when the sample exits.
+        if (gStablePowerState)
+        {
+            setStablePowerState(pRenderer, false);
+            gStablePowerState = false;
+        }
+
         exitRaytracing(pRenderer, pRaytracing);
         exitRenderer(pRenderer);
         exitGPUConfiguration();
@@ -476,8 +812,12 @@ public:
 
             static const char* raytracingOptions[] = {
                 "Ray Query (MegaKernel)",
-                "Wavefront Path Tracing",
-                "Persistent Wave Path Tracing",
+                "Wavefront v1 (full-dispatch generic)",
+                "Wavefront v2 (compacted + indirect)",
+                "Persistent Warps (TG256)",
+                "Persistent Warps (TG128)",
+                "Persistent Warps (TG64)",
+                "Persistent Wavefront (1 Bounce/Task, TG128)",
             };
             COMPILE_ASSERT(TF_ARRAY_COUNT(raytracingOptions) == RAYTRACING_TECHNIQUE_COUNT);
             if (RAYTRACING_TECHNIQUE_COUNT > 1)
@@ -494,6 +834,97 @@ public:
                 LabelWidget raytracingLabel;
                 uiAddComponentWidget(pGuiWindow, raytracingOptions[0], &raytracingLabel, WIDGET_TYPE_LABEL);
             }
+
+            static const char* maxBounceOptions[] = { "1", "2", "3", "4", "6", "8" };
+            DropdownWidget     maxBounceDropdown;
+            maxBounceDropdown.mCount = TF_ARRAY_COUNT(maxBounceOptions);
+            maxBounceDropdown.pNames = maxBounceOptions;
+            maxBounceDropdown.pData = &gMaxBouncePreset;
+            UIWidget* maxBounceWidget = uiAddComponentWidget(pGuiWindow, "Max Bounces", &maxBounceDropdown, WIDGET_TYPE_DROPDOWN);
+            luaRegisterWidget(maxBounceWidget);
+
+            static const char* raytracingPresetOptions[] = {
+                "1", "2", "3", "4", "5", "6", "7", "8"
+            };
+            COMPILE_ASSERT(TF_ARRAY_COUNT(raytracingPresetOptions) == TF_ARRAY_COUNT(gRaytracingPresets));
+
+            SeparatorWidget presetSeparator;
+            uiAddComponentWidget(pGuiWindow, "", &presetSeparator, WIDGET_TYPE_SEPARATOR);
+            LabelWidget presetLabel;
+            uiAddComponentWidget(pGuiWindow, "Raytracing Presets", &presetLabel, WIDGET_TYPE_LABEL);
+            for (uint32_t i = 0; i < TF_ARRAY_COUNT(raytracingPresetOptions); ++i)
+            {
+                ButtonWidget presetButton;
+                UIWidget*   presetWidget =
+                    uiAddComponentWidget(pGuiWindow, raytracingPresetOptions[i], &presetButton, WIDGET_TYPE_BUTTON);
+                presetWidget->mSameLine = true;
+                uiSetWidgetOnEditedCallback(presetWidget, (void*)&gRaytracingPresets[i], applyRaytracingPreset);
+                luaRegisterWidget(presetWidget);
+            }
+
+            SeparatorWidget benchmarkSeparator;
+            uiAddComponentWidget(pGuiWindow, "", &benchmarkSeparator, WIDGET_TYPE_SEPARATOR);
+            LabelWidget benchmarkLabel;
+            uiAddComponentWidget(pGuiWindow, "Raytracing Parameter Scan", &benchmarkLabel, WIDGET_TYPE_LABEL);
+
+            ButtonWidget startBenchmarkButton;
+            UIWidget*   startBenchmarkWidget =
+                uiAddComponentWidget(pGuiWindow, "Start Parameter Scan", &startBenchmarkButton, WIDGET_TYPE_BUTTON);
+            uiSetWidgetOnEditedCallback(startBenchmarkWidget, NULL, startRaytracingBenchmark);
+            luaRegisterWidget(startBenchmarkWidget);
+
+            ButtonWidget saveBenchmarkButton;
+            UIWidget*   saveBenchmarkWidget =
+                uiAddComponentWidget(pGuiWindow, "Save Benchmark Results", &saveBenchmarkButton, WIDGET_TYPE_BUTTON);
+            uiSetWidgetOnEditedCallback(saveBenchmarkWidget, NULL, saveRaytracingBenchmark);
+            luaRegisterWidget(saveBenchmarkWidget);
+
+            DynamicTextWidget benchmarkResultsText = {};
+            benchmarkResultsText.pText = &gRaytracingBenchmarkResults;
+            benchmarkResultsText.pColor = &gRaytracingBenchmarkTextColor;
+            luaRegisterWidget(uiAddComponentWidget(pGuiWindow, "Benchmark Results", &benchmarkResultsText, WIDGET_TYPE_DYNAMIC_TEXT));
+
+            CheckboxWidget stablePowerStateCheckbox;
+            stablePowerStateCheckbox.pData = &gStablePowerState;
+            UIWidget* stablePowerWidget =
+                uiAddComponentWidget(pGuiWindow, "Stable Power State (D3D12)", &stablePowerStateCheckbox, WIDGET_TYPE_CHECKBOX);
+            luaRegisterWidget(stablePowerWidget);
+
+            static const char* persistentGroupOptions[] = { "16", "32", "64", "128", "256", "512" };
+            DropdownWidget     persistentGroupDropdown;
+            persistentGroupDropdown.mCount = TF_ARRAY_COUNT(persistentGroupOptions);
+            persistentGroupDropdown.pNames = persistentGroupOptions;
+            persistentGroupDropdown.pData = &gPersistentGroupPreset;
+            UIWidget* persistentGroupWidget =
+                uiAddComponentWidget(pGuiWindow, "Persistent Resident Groups", &persistentGroupDropdown, WIDGET_TYPE_DROPDOWN);
+            luaRegisterWidget(persistentGroupWidget);
+
+            static const char* persistentWavefrontGroupOptions[] = { "64", "128", "256" };
+            DropdownWidget     persistentWavefrontGroupDropdown;
+            persistentWavefrontGroupDropdown.mCount = TF_ARRAY_COUNT(persistentWavefrontGroupOptions);
+            persistentWavefrontGroupDropdown.pNames = persistentWavefrontGroupOptions;
+            persistentWavefrontGroupDropdown.pData = &gPersistentWavefrontGroupPreset;
+            UIWidget* persistentWavefrontGroupWidget = uiAddComponentWidget(
+                pGuiWindow, "Persistent Wavefront Thread Group Size", &persistentWavefrontGroupDropdown, WIDGET_TYPE_DROPDOWN);
+            luaRegisterWidget(persistentWavefrontGroupWidget);
+
+            static const char* persistentSchedulingOptions[] = {
+                "Dynamic Batch Dequeue (Atomic)",
+                "Static Grid-Stride (No Atomic)",
+            };
+            DropdownWidget persistentSchedulingDropdown;
+            persistentSchedulingDropdown.mCount = TF_ARRAY_COUNT(persistentSchedulingOptions);
+            persistentSchedulingDropdown.pNames = persistentSchedulingOptions;
+            persistentSchedulingDropdown.pData = &gPersistentSchedulingMode;
+            luaRegisterWidget(
+                uiAddComponentWidget(pGuiWindow, "Persistent Scheduling", &persistentSchedulingDropdown, WIDGET_TYPE_DROPDOWN));
+
+            static const char* persistentBatchOptions[] = { "1", "2", "4", "8" };
+            DropdownWidget     persistentBatchDropdown;
+            persistentBatchDropdown.mCount = TF_ARRAY_COUNT(persistentBatchOptions);
+            persistentBatchDropdown.pNames = persistentBatchOptions;
+            persistentBatchDropdown.pData = &gPersistentBatchPreset;
+            luaRegisterWidget(uiAddComponentWidget(pGuiWindow, "Persistent Batch Dequeue", &persistentBatchDropdown, WIDGET_TYPE_DROPDOWN));
 
             LabelWidget notSupportedLabel;
             uiAddDynamicWidgets(&mDynamicWidgets[0], "Raytracing technique is not supported on this GPU", &notSupportedLabel,
@@ -590,7 +1021,9 @@ public:
                 pathStateDesc.mDesc.mDescriptors = DESCRIPTOR_TYPE_RW_BUFFER;
                 pathStateDesc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
                 pathStateDesc.mDesc.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
-                pathStateDesc.mDesc.mElementCount = pixelCount * 5; // 5 float4 values / path
+                // 10 float4 / pixel gives two ping-pong banks of 5 float4/path.
+                // Wavefront V1 still uses the first bank with pixel-indexed path IDs.
+                pathStateDesc.mDesc.mElementCount = pixelCount * 10;
                 // RWBuffer(float4) is a TYPED buffer view, not a structured view.
                 pathStateDesc.mDesc.mFormat = TinyImageFormat_R32G32B32A32_SFLOAT;
                 pathStateDesc.mDesc.mStructStride = 0;
@@ -621,13 +1054,31 @@ public:
                 counterDesc.mDesc.mDescriptors = DESCRIPTOR_TYPE_RW_BUFFER;
                 counterDesc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
                 counterDesc.mDesc.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
-                counterDesc.mDesc.mElementCount = 4;
+                // 32 uint counters: enough for the generic persistent-wavefront
+                // scheduler (8 heads + 8 counts + 8 outstanding + phase/status).
+                counterDesc.mDesc.mElementCount = 32;
                 counterDesc.mDesc.mFormat = TinyImageFormat_R32_UINT;
                 counterDesc.mDesc.mStructStride = 0;
-                counterDesc.mDesc.mSize = 4 * sizeof(uint32_t);
+                counterDesc.mDesc.mSize = 32 * sizeof(uint32_t);
                 counterDesc.mDesc.pName = "WavefrontCounters";
                 counterDesc.ppBuffer = &pWavefrontCounters;
                 addResource(&counterDesc, NULL);
+
+                BufferLoadDesc indirectDesc = {};
+                indirectDesc.mDesc.mDescriptors = DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_INDIRECT_BUFFER;
+                indirectDesc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                indirectDesc.mDesc.mStartState = RESOURCE_STATE_INDIRECT_ARGUMENT;
+                indirectDesc.mDesc.mElementCount = 3;
+                indirectDesc.mDesc.mFormat = TinyImageFormat_R32_UINT;
+                indirectDesc.mDesc.mStructStride = 0;
+                indirectDesc.mDesc.mSize = sizeof(IndirectDispatchArguments);
+                indirectDesc.mDesc.pName = "WavefrontIndirectArgsA";
+                indirectDesc.ppBuffer = &pWavefrontIndirectArgs;
+                addResource(&indirectDesc, NULL);
+
+                indirectDesc.mDesc.pName = "WavefrontIndirectArgsB";
+                indirectDesc.ppBuffer = &pWavefrontIndirectArgsB;
+                addResource(&indirectDesc, NULL);
 
 #if USE_DENOISER
                 uavDesc.mFormat = TinyImageFormat_B10G10R10A2_UNORM;
@@ -704,6 +1155,8 @@ public:
                 removeResource(pWavefrontQueueA);
                 removeResource(pWavefrontQueueB);
                 removeResource(pWavefrontCounters);
+                removeResource(pWavefrontIndirectArgs);
+                removeResource(pWavefrontIndirectArgsB);
 #if USE_DENOISER
                 removeResource(pAlbedoTexture);
 #endif
@@ -751,12 +1204,42 @@ public:
         pCameraController->update(deltaTime);
 
         static uint32_t prevRaytracingTechnique = UINT32_MAX;
-        if (gRaytracingTechnique != prevRaytracingTechnique)
+        static uint32_t prevMaxBouncePreset = UINT32_MAX;
+        static uint32_t prevPersistentGroupPreset = UINT32_MAX;
+        static uint32_t prevPersistentSchedulingMode = UINT32_MAX;
+        static uint32_t prevPersistentBatchPreset = UINT32_MAX;
+        static uint32_t prevPersistentWavefrontGroupPreset = UINT32_MAX;
+        if (gRaytracingTechnique != prevRaytracingTechnique || gMaxBouncePreset != prevMaxBouncePreset ||
+            gPersistentGroupPreset != prevPersistentGroupPreset || gPersistentSchedulingMode != prevPersistentSchedulingMode ||
+            gPersistentBatchPreset != prevPersistentBatchPreset ||
+            gPersistentWavefrontGroupPreset != prevPersistentWavefrontGroupPreset)
         {
             mFrameIdx = 0;
             prevRaytracingTechnique = gRaytracingTechnique;
+            prevMaxBouncePreset = gMaxBouncePreset;
+            prevPersistentGroupPreset = gPersistentGroupPreset;
+            prevPersistentSchedulingMode = gPersistentSchedulingMode;
+            prevPersistentBatchPreset = gPersistentBatchPreset;
+            prevPersistentWavefrontGroupPreset = gPersistentWavefrontGroupPreset;
             mPathTracingData = {};
             updateUIVisibility();
+        }
+
+        // Apply the UI toggle only when it changes. If the D3D12 call fails,
+        // restore the checkbox to the last successfully applied state.
+        static bool stablePowerInitialized = false;
+        static bool stablePowerApplied = false;
+        if (!stablePowerInitialized || gStablePowerState != stablePowerApplied)
+        {
+            if (setStablePowerState(pRenderer, gStablePowerState))
+            {
+                stablePowerApplied = gStablePowerState;
+            }
+            else
+            {
+                gStablePowerState = stablePowerApplied;
+            }
+            stablePowerInitialized = true;
         }
 
         mat4 viewMat = pCameraController->getViewMatrix().mCamera;
@@ -856,6 +1339,20 @@ public:
 
             cb.mWorldMatrix = SanMiguelProp.mWorldMatrix;
 
+            cb.mMaxBounces = gMaxBounceValues[gMaxBouncePreset];
+            cb.mPersistentBatchSize = gPersistentBatchSizes[gPersistentBatchPreset];
+            uint32_t persistentTgSizeForCB = 64;
+            if (PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING == gRaytracingTechnique)
+                persistentTgSizeForCB = gPersistentWavefrontGroupSizes[gPersistentWavefrontGroupPreset];
+            else if (PERSISTENT_WAVE_128_PATH_TRACING == gRaytracingTechnique)
+                persistentTgSizeForCB = 128;
+            else if (PERSISTENT_WAVE_256_PATH_TRACING == gRaytracingTechnique)
+                persistentTgSizeForCB = 256;
+            const uint32_t persistentPixelCountForCB = mSettings.mWidth * mSettings.mHeight;
+            const uint32_t persistentNormalGroupsForCB = round_up(persistentPixelCountForCB, persistentTgSizeForCB) / persistentTgSizeForCB;
+            const uint32_t persistentActualGroupsForCB = min(gPersistentGroupCounts[gPersistentGroupPreset], persistentNormalGroupsForCB);
+            cb.mPersistentTotalThreads = persistentActualGroupsForCB * persistentTgSizeForCB;
+
             BufferUpdateDesc bufferUpdate = { pRayGenConfigBuffer[mFrameIdx] };
             beginUpdateResource(&bufferUpdate);
             memcpy(bufferUpdate.pMappedData, &cb, sizeof(cb));
@@ -916,7 +1413,7 @@ public:
             /************************************************************************/
             // Transition UAV texture so raytracing shader can write to it
             /************************************************************************/
-            cmdBeginGpuTimestampQuery(pCmd, gGpuProfileToken, "Path Trace Scene");
+                mRaytracingGpuProfileToken = cmdBeginGpuTimestampQuery(pCmd, gGpuProfileToken, "Path Trace Scene");
             TextureBarrier uavBarriers[] = {
                 { pComputeOutput, RESOURCE_STATE_PIXEL_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS },
             };
@@ -925,14 +1422,12 @@ public:
             // Perform raytracing
             /************************************************************************/
             if (RAY_QUERY == gRaytracingTechnique)
-                cmdBindPipeline(pCmd, pPipeline[RAY_QUERY]);
-
-            cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
-            cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
-            cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
-
-            if (RAY_QUERY == gRaytracingTechnique)
             {
+                cmdBindPipeline(pCmd, pPipeline[RAY_QUERY]);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
+
                 const uint32_t* numThreads = pShaderRayQuery->mNumThreadsPerGroup;
                 uint32_t        groupX = round_up(mSettings.mWidth, numThreads[0]) / numThreads[0];
                 uint32_t        groupY = round_up(mSettings.mHeight, numThreads[1]) / numThreads[1];
@@ -940,9 +1435,13 @@ public:
             }
             else if (WAVEFRONT_PATH_TRACING == gRaytracingTechnique)
             {
+                // Generic full-dispatch wavefront baseline.
+                // Every bounce compacts survivors into the alternate uint path-ID queue,
+                // but each bounce still launches the full pixel-sized dispatch.
                 const uint32_t pixelCount = mSettings.mWidth * mSettings.mHeight;
                 const uint32_t threads = pShaderWavefrontGenerate->mNumThreadsPerGroup[0];
                 const uint32_t groups = round_up(pixelCount, threads) / threads;
+                const uint32_t maxBounces = gMaxBounceValues[gMaxBouncePreset];
 
                 BufferBarrier uavSync[] = {
                     { pWavefrontPathState, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS },
@@ -952,39 +1451,211 @@ public:
                 };
 
                 cmdBindPipeline(pCmd, pPipelineWavefrontGenerate);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
                 cmdDispatch(pCmd, groups, 1, 1);
                 cmdResourceBarrier(pCmd, TF_ARRAY_COUNT(uavSync), uavSync, 0, NULL, 0, NULL);
 
-                // Correctness-first wavefront implementation:
-                // dispatch the maximum path count and let the shader early-out against queueCount.
-                // Once this is verified, this is the exact spot to switch to DispatchIndirect.
-                cmdBindPipeline(pCmd, pPipelineWavefrontBounce0);
-                cmdDispatch(pCmd, groups, 1, 1);
-                cmdResourceBarrier(pCmd, TF_ARRAY_COUNT(uavSync), uavSync, 0, NULL, 0, NULL);
+                for (uint32_t bounce = 0; bounce < maxBounces; ++bounce)
+                {
+                    // Reset only the OUTPUT queue count. The input queue remains intact.
+                    Pipeline* pResetPipeline = (bounce & 1u) ? pPipelineWavefrontResetA : pPipelineWavefrontResetB;
+                    cmdBindPipeline(pCmd, pResetPipeline);
+                    cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
+                    cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
+                    cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
+                    cmdDispatch(pCmd, 1, 1, 1);
+                    cmdResourceBarrier(pCmd, 1, &uavSync[3], 0, NULL, 0, NULL);
 
-                cmdBindPipeline(pCmd, pPipelineWavefrontBounce1);
-                cmdDispatch(pCmd, groups, 1, 1);
-                cmdResourceBarrier(pCmd, TF_ARRAY_COUNT(uavSync), uavSync, 0, NULL, 0, NULL);
+                    Pipeline* pBouncePipeline = (bounce & 1u) ? pPipelineWavefrontBounce1 : pPipelineWavefrontBounce0;
+                    cmdBindPipeline(pCmd, pBouncePipeline);
+                    cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
+                    cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
+                    cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
+                    cmdDispatch(pCmd, groups, 1, 1);
+                    cmdResourceBarrier(pCmd, TF_ARRAY_COUNT(uavSync), uavSync, 0, NULL, 0, NULL);
+                }
 
                 cmdBindPipeline(pCmd, pPipelineWavefrontResolve);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
                 cmdDispatch(pCmd, groups, 1, 1);
             }
-            else if (PERSISTENT_WAVE_PATH_TRACING == gRaytracingTechnique)
+            else if (WAVEFRONT_V2_PATH_TRACING == gRaytracingTechnique)
             {
-                BufferBarrier counterSync = { pWavefrontCounters, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS };
-
-                cmdBindPipeline(pCmd, pPipelinePersistentReset);
-                cmdDispatch(pCmd, 1, 1, 1);
-                cmdResourceBarrier(pCmd, 1, &counterSync, 0, NULL, 0, NULL);
-
-                // Deliberately bounded number of groups: these groups persist and repeatedly
-                // dequeue wave-sized chunks of pixels until the global queue is exhausted.
+                // Generic compacted wavefront:
+                // primary -> bank A -> bank B -> bank A ... using DispatchIndirect
+                // for every continuation bounce.
                 const uint32_t pixelCount = mSettings.mWidth * mSettings.mHeight;
-                const uint32_t threads = pShaderPersistentWave->mNumThreadsPerGroup[0];
-                const uint32_t normalGroups = round_up(pixelCount, threads) / threads;
-                const uint32_t persistentGroups = min(256u, normalGroups);
+                const uint32_t threads = pShaderWavefrontV2Primary->mNumThreadsPerGroup[0];
+                const uint32_t groups = round_up(pixelCount, threads) / threads;
+                const uint32_t maxBounces = gMaxBounceValues[gMaxBouncePreset];
 
-                cmdBindPipeline(pCmd, pPipelinePersistentWave);
+                // Keep both indirect buffers in UAV state while producers/reset shaders write
+                // them. Each one is temporarily transitioned to INDIRECT_ARGUMENT only for
+                // the dispatch that consumes it.
+                BufferBarrier indirectToUav[] = {
+                    { pWavefrontIndirectArgs, RESOURCE_STATE_INDIRECT_ARGUMENT, RESOURCE_STATE_UNORDERED_ACCESS },
+                    { pWavefrontIndirectArgsB, RESOURCE_STATE_INDIRECT_ARGUMENT, RESOURCE_STATE_UNORDERED_ACCESS },
+                };
+                cmdResourceBarrier(pCmd, TF_ARRAY_COUNT(indirectToUav), indirectToUav, 0, NULL, 0, NULL);
+
+                // Reset queue/args A for the primary producer.
+                cmdBindPipeline(pCmd, pPipelineWavefrontV2Reset);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
+                cmdDispatch(pCmd, 1, 1, 1);
+
+                BufferBarrier primaryResetSync[] = {
+                    { pWavefrontCounters, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS },
+                    { pWavefrontIndirectArgs, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS },
+                };
+                cmdResourceBarrier(pCmd, TF_ARRAY_COUNT(primaryResetSync), primaryResetSync, 0, NULL, 0, NULL);
+
+                cmdBindPipeline(pCmd, pPipelineWavefrontV2Primary);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
+                cmdDispatch(pCmd, groups, 1, 1);
+
+                BufferBarrier producerSync[] = {
+                    { pWavefrontPathState, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS },
+                    { pWavefrontCounters, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS },
+                    { pWavefrontIndirectArgs, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS },
+                    { pWavefrontIndirectArgsB, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS },
+                };
+                cmdResourceBarrier(pCmd, TF_ARRAY_COUNT(producerSync), producerSync, 0, NULL, 0, NULL);
+
+                // bounce=1 consumes A and produces B. bounce=2 consumes B and produces A.
+                for (uint32_t bounce = 1; bounce < maxBounces; ++bounce)
+                {
+                    const bool inputIsA = (bounce & 1u) != 0;
+                    Buffer*    pInputArgs = inputIsA ? pWavefrontIndirectArgs : pWavefrontIndirectArgsB;
+                    Buffer*    pOutputArgs = inputIsA ? pWavefrontIndirectArgsB : pWavefrontIndirectArgs;
+                    Pipeline*  pResetOutput = inputIsA ? pPipelineWavefrontV2ResetB : pPipelineWavefrontV2Reset;
+                    Pipeline*  pBouncePipeline = inputIsA ? pPipelineWavefrontV2Secondary : pPipelineWavefrontV2SecondaryB;
+
+                    // Zero the next compacted queue and its indirect dispatch args.
+                    cmdBindPipeline(pCmd, pResetOutput);
+                    cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
+                    cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
+                    cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
+                    cmdDispatch(pCmd, 1, 1, 1);
+
+                    BufferBarrier resetSync[] = {
+                        { pWavefrontCounters, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS },
+                        { pOutputArgs, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS },
+                    };
+                    cmdResourceBarrier(pCmd, TF_ARRAY_COUNT(resetSync), resetSync, 0, NULL, 0, NULL);
+
+                    BufferBarrier toIndirect = { pInputArgs, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_INDIRECT_ARGUMENT };
+                    cmdResourceBarrier(pCmd, 1, &toIndirect, 0, NULL, 0, NULL);
+
+                    cmdBindPipeline(pCmd, pBouncePipeline);
+                    cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
+                    cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
+                    cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
+                    cmdExecuteIndirect(pCmd, INDIRECT_DISPATCH, 1, pInputArgs, 0, NULL, 0);
+
+                    BufferBarrier backToUav = { pInputArgs, RESOURCE_STATE_INDIRECT_ARGUMENT, RESOURCE_STATE_UNORDERED_ACCESS };
+                    cmdResourceBarrier(pCmd, 1, &backToUav, 0, NULL, 0, NULL);
+
+                    cmdResourceBarrier(pCmd, TF_ARRAY_COUNT(producerSync), producerSync, 0, NULL, 0, NULL);
+                }
+
+                // Restore the invariant expected at the start of the next frame.
+                BufferBarrier indirectToIdle[] = {
+                    { pWavefrontIndirectArgs, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_INDIRECT_ARGUMENT },
+                    { pWavefrontIndirectArgsB, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_INDIRECT_ARGUMENT },
+                };
+                cmdResourceBarrier(pCmd, TF_ARRAY_COUNT(indirectToIdle), indirectToIdle, 0, NULL, 0, NULL);
+            }
+            else if (PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING == gRaytracingTechnique)
+            {
+                // Persistent wavefront: ONE BOUNCE is one schedulable work item.
+                // The same persistent dispatch iterates up to Max Bounces; survivors are
+                // compacted at every bounce boundary into ping-pong continuation banks.
+                const uint32_t pixelCount = mSettings.mWidth * mSettings.mHeight;
+                Shader*   pPersistentWavefrontShader = pShaderPersistentWavefront128;
+                Pipeline* pPersistentWavefrontPipeline = pPipelinePersistentWavefront128;
+                if (gPersistentWavefrontGroupPreset == 0)
+                {
+                    pPersistentWavefrontShader = pShaderPersistentWavefront64;
+                    pPersistentWavefrontPipeline = pPipelinePersistentWavefront64;
+                }
+                else if (gPersistentWavefrontGroupPreset == 2)
+                {
+                    pPersistentWavefrontShader = pShaderPersistentWavefront256;
+                    pPersistentWavefrontPipeline = pPipelinePersistentWavefront256;
+                }
+
+                const uint32_t threads = pPersistentWavefrontShader->mNumThreadsPerGroup[0];
+                const uint32_t normalGroups = round_up(pixelCount, threads) / threads;
+                const uint32_t persistentGroups = min(gPersistentGroupCounts[gPersistentGroupPreset], normalGroups);
+
+                BufferBarrier resetSync[] = {
+                    { pWavefrontPathState, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS },
+                    { pWavefrontCounters, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS },
+                };
+
+                cmdBindPipeline(pCmd, pPipelinePersistentWavefrontReset);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
+                cmdDispatch(pCmd, 1, 1, 1);
+                cmdResourceBarrier(pCmd, TF_ARRAY_COUNT(resetSync), resetSync, 0, NULL, 0, NULL);
+
+                cmdBindPipeline(pCmd, pPersistentWavefrontPipeline);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
+                cmdDispatch(pCmd, persistentGroups, 1, 1);
+            }
+            else if (PERSISTENT_WAVE_256_PATH_TRACING == gRaytracingTechnique || PERSISTENT_WAVE_128_PATH_TRACING == gRaytracingTechnique ||
+                     PERSISTENT_WAVE_64_PATH_TRACING == gRaytracingTechnique)
+            {
+                const uint32_t pixelCount = mSettings.mWidth * mSettings.mHeight;
+
+                Shader*   pPersistentShader = NULL;
+                Pipeline* pPersistentPipeline = NULL;
+                if (PERSISTENT_WAVE_64_PATH_TRACING == gRaytracingTechnique)
+                {
+                    pPersistentShader = (gPersistentSchedulingMode == 0) ? pShaderPersistentWave64 : pShaderPersistentStatic64;
+                    pPersistentPipeline = (gPersistentSchedulingMode == 0) ? pPipelinePersistentWave64 : pPipelinePersistentStatic64;
+                }
+                else if (PERSISTENT_WAVE_128_PATH_TRACING == gRaytracingTechnique)
+                {
+                    pPersistentShader = (gPersistentSchedulingMode == 0) ? pShaderPersistentWave128 : pShaderPersistentStatic128;
+                    pPersistentPipeline = (gPersistentSchedulingMode == 0) ? pPipelinePersistentWave128 : pPipelinePersistentStatic128;
+                }
+                else
+                {
+                    pPersistentShader = (gPersistentSchedulingMode == 0) ? pShaderPersistentWave256 : pShaderPersistentStatic256;
+                    pPersistentPipeline = (gPersistentSchedulingMode == 0) ? pPipelinePersistentWave256 : pPipelinePersistentStatic256;
+                }
+
+                const uint32_t threads = pPersistentShader->mNumThreadsPerGroup[0];
+                const uint32_t normalGroups = round_up(pixelCount, threads) / threads;
+                const uint32_t persistentGroups = min(gPersistentGroupCounts[gPersistentGroupPreset], normalGroups);
+
+                if (gPersistentSchedulingMode == 0)
+                {
+                    BufferBarrier counterSync = { pWavefrontCounters, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS };
+                    cmdBindPipeline(pCmd, pPipelinePersistentReset);
+                    cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
+                    cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
+                    cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
+                    cmdDispatch(pCmd, 1, 1, 1);
+                    cmdResourceBarrier(pCmd, 1, &counterSync, 0, NULL, 0, NULL);
+                }
+
+                cmdBindPipeline(pCmd, pPersistentPipeline);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
                 cmdDispatch(pCmd, persistentGroups, 1, 1);
             }
             /************************************************************************/
@@ -1093,6 +1764,8 @@ public:
         queuePresent(pQueue, &presentDesc);
         flipProfiler();
 
+        processBenchmarkFrame();
+
         mFrameIdx = (mFrameIdx + 1) % gDataBufferCount;
         /************************************************************************/
         /************************************************************************/
@@ -1180,13 +1853,77 @@ public:
             wfResolve.mComp.pFileName = "RayQueryWavefrontResolve.comp";
             addShader(pRenderer, &wfResolve, &pShaderWavefrontResolve);
 
+            ShaderLoadDesc wfResetA = {};
+            wfResetA.mComp.pFileName = "RayQueryWavefrontResetA.comp";
+            addShader(pRenderer, &wfResetA, &pShaderWavefrontResetA);
+
+            ShaderLoadDesc wfResetB = {};
+            wfResetB.mComp.pFileName = "RayQueryWavefrontResetB.comp";
+            addShader(pRenderer, &wfResetB, &pShaderWavefrontResetB);
+
+            ShaderLoadDesc wfV2Reset = {};
+            wfV2Reset.mComp.pFileName = "RayQueryWavefrontV2Reset.comp";
+            addShader(pRenderer, &wfV2Reset, &pShaderWavefrontV2Reset);
+
+            ShaderLoadDesc wfV2ResetB = {};
+            wfV2ResetB.mComp.pFileName = "RayQueryWavefrontV2ResetB.comp";
+            addShader(pRenderer, &wfV2ResetB, &pShaderWavefrontV2ResetB);
+
+            ShaderLoadDesc wfV2Primary = {};
+            wfV2Primary.mComp.pFileName = "RayQueryWavefrontV2Primary.comp";
+            addShader(pRenderer, &wfV2Primary, &pShaderWavefrontV2Primary);
+
+            ShaderLoadDesc wfV2Secondary = {};
+            wfV2Secondary.mComp.pFileName = "RayQueryWavefrontV2Secondary.comp";
+            addShader(pRenderer, &wfV2Secondary, &pShaderWavefrontV2Secondary);
+
+            ShaderLoadDesc wfV2SecondaryB = {};
+            wfV2SecondaryB.mComp.pFileName = "RayQueryWavefrontV2SecondaryB.comp";
+            addShader(pRenderer, &wfV2SecondaryB, &pShaderWavefrontV2SecondaryB);
+
             ShaderLoadDesc persistentReset = {};
             persistentReset.mComp.pFileName = "RayQueryPersistentReset.comp";
             addShader(pRenderer, &persistentReset, &pShaderPersistentReset);
 
-            ShaderLoadDesc persistentWave = {};
-            persistentWave.mComp.pFileName = "RayQueryPersistentWave.comp";
-            addShader(pRenderer, &persistentWave, &pShaderPersistentWave);
+            ShaderLoadDesc persistentWave256 = {};
+            persistentWave256.mComp.pFileName = "RayQueryPersistentWave256.comp";
+            addShader(pRenderer, &persistentWave256, &pShaderPersistentWave256);
+
+            ShaderLoadDesc persistentWave128 = {};
+            persistentWave128.mComp.pFileName = "RayQueryPersistentWave128.comp";
+            addShader(pRenderer, &persistentWave128, &pShaderPersistentWave128);
+
+            ShaderLoadDesc persistentWave64 = {};
+            persistentWave64.mComp.pFileName = "RayQueryPersistentWave64.comp";
+            addShader(pRenderer, &persistentWave64, &pShaderPersistentWave64);
+
+            ShaderLoadDesc persistentStatic256 = {};
+            persistentStatic256.mComp.pFileName = "RayQueryPersistentStatic256.comp";
+            addShader(pRenderer, &persistentStatic256, &pShaderPersistentStatic256);
+
+            ShaderLoadDesc persistentStatic128 = {};
+            persistentStatic128.mComp.pFileName = "RayQueryPersistentStatic128.comp";
+            addShader(pRenderer, &persistentStatic128, &pShaderPersistentStatic128);
+
+            ShaderLoadDesc persistentStatic64 = {};
+            persistentStatic64.mComp.pFileName = "RayQueryPersistentStatic64.comp";
+            addShader(pRenderer, &persistentStatic64, &pShaderPersistentStatic64);
+
+            ShaderLoadDesc persistentWavefrontReset = {};
+            persistentWavefrontReset.mComp.pFileName = "RayQueryPersistentWavefrontReset.comp";
+            addShader(pRenderer, &persistentWavefrontReset, &pShaderPersistentWavefrontReset);
+
+            ShaderLoadDesc persistentWavefront = {};
+            persistentWavefront.mComp.pFileName = "RayQueryPersistentWavefront128.comp";
+            addShader(pRenderer, &persistentWavefront, &pShaderPersistentWavefront128);
+
+            ShaderLoadDesc persistentWavefront64 = {};
+            persistentWavefront64.mComp.pFileName = "RayQueryPersistentWavefront64.comp";
+            addShader(pRenderer, &persistentWavefront64, &pShaderPersistentWavefront64);
+
+            ShaderLoadDesc persistentWavefront256 = {};
+            persistentWavefront256.mComp.pFileName = "RayQueryPersistentWavefront256.comp";
+            addShader(pRenderer, &persistentWavefront256, &pShaderPersistentWavefront256);
         }
 
 #if USE_DENOISER
@@ -1223,8 +1960,24 @@ public:
             removeShader(pRenderer, pShaderWavefrontBounce0);
             removeShader(pRenderer, pShaderWavefrontBounce1);
             removeShader(pRenderer, pShaderWavefrontResolve);
+            removeShader(pRenderer, pShaderWavefrontResetA);
+            removeShader(pRenderer, pShaderWavefrontResetB);
+            removeShader(pRenderer, pShaderWavefrontV2Reset);
+            removeShader(pRenderer, pShaderWavefrontV2ResetB);
+            removeShader(pRenderer, pShaderWavefrontV2Primary);
+            removeShader(pRenderer, pShaderWavefrontV2Secondary);
+            removeShader(pRenderer, pShaderWavefrontV2SecondaryB);
             removeShader(pRenderer, pShaderPersistentReset);
-            removeShader(pRenderer, pShaderPersistentWave);
+            removeShader(pRenderer, pShaderPersistentWave256);
+            removeShader(pRenderer, pShaderPersistentWave128);
+            removeShader(pRenderer, pShaderPersistentWave64);
+            removeShader(pRenderer, pShaderPersistentStatic256);
+            removeShader(pRenderer, pShaderPersistentStatic128);
+            removeShader(pRenderer, pShaderPersistentStatic64);
+            removeShader(pRenderer, pShaderPersistentWavefrontReset);
+            removeShader(pRenderer, pShaderPersistentWavefront128);
+            removeShader(pRenderer, pShaderPersistentWavefront64);
+            removeShader(pRenderer, pShaderPersistentWavefront256);
         }
     }
 
@@ -1257,8 +2010,24 @@ public:
             addExperimentalComputePipeline(pShaderWavefrontBounce0, &pPipelineWavefrontBounce0);
             addExperimentalComputePipeline(pShaderWavefrontBounce1, &pPipelineWavefrontBounce1);
             addExperimentalComputePipeline(pShaderWavefrontResolve, &pPipelineWavefrontResolve);
+            addExperimentalComputePipeline(pShaderWavefrontResetA, &pPipelineWavefrontResetA);
+            addExperimentalComputePipeline(pShaderWavefrontResetB, &pPipelineWavefrontResetB);
+            addExperimentalComputePipeline(pShaderWavefrontV2Reset, &pPipelineWavefrontV2Reset);
+            addExperimentalComputePipeline(pShaderWavefrontV2ResetB, &pPipelineWavefrontV2ResetB);
+            addExperimentalComputePipeline(pShaderWavefrontV2Primary, &pPipelineWavefrontV2Primary);
+            addExperimentalComputePipeline(pShaderWavefrontV2Secondary, &pPipelineWavefrontV2Secondary);
+            addExperimentalComputePipeline(pShaderWavefrontV2SecondaryB, &pPipelineWavefrontV2SecondaryB);
             addExperimentalComputePipeline(pShaderPersistentReset, &pPipelinePersistentReset);
-            addExperimentalComputePipeline(pShaderPersistentWave, &pPipelinePersistentWave);
+            addExperimentalComputePipeline(pShaderPersistentWave256, &pPipelinePersistentWave256);
+            addExperimentalComputePipeline(pShaderPersistentWave128, &pPipelinePersistentWave128);
+            addExperimentalComputePipeline(pShaderPersistentWave64, &pPipelinePersistentWave64);
+            addExperimentalComputePipeline(pShaderPersistentStatic256, &pPipelinePersistentStatic256);
+            addExperimentalComputePipeline(pShaderPersistentStatic128, &pPipelinePersistentStatic128);
+            addExperimentalComputePipeline(pShaderPersistentStatic64, &pPipelinePersistentStatic64);
+            addExperimentalComputePipeline(pShaderPersistentWavefrontReset, &pPipelinePersistentWavefrontReset);
+            addExperimentalComputePipeline(pShaderPersistentWavefront128, &pPipelinePersistentWavefront128);
+            addExperimentalComputePipeline(pShaderPersistentWavefront64, &pPipelinePersistentWavefront64);
+            addExperimentalComputePipeline(pShaderPersistentWavefront256, &pPipelinePersistentWavefront256);
 
 #if defined(SHADER_STATS_AVAILABLE)
             {
@@ -1363,13 +2132,29 @@ public:
         removePipeline(pRenderer, pPipelineWavefrontBounce0);
         removePipeline(pRenderer, pPipelineWavefrontBounce1);
         removePipeline(pRenderer, pPipelineWavefrontResolve);
+        removePipeline(pRenderer, pPipelineWavefrontResetA);
+        removePipeline(pRenderer, pPipelineWavefrontResetB);
+        removePipeline(pRenderer, pPipelineWavefrontV2Reset);
+        removePipeline(pRenderer, pPipelineWavefrontV2ResetB);
+        removePipeline(pRenderer, pPipelineWavefrontV2Primary);
+        removePipeline(pRenderer, pPipelineWavefrontV2Secondary);
+        removePipeline(pRenderer, pPipelineWavefrontV2SecondaryB);
         removePipeline(pRenderer, pPipelinePersistentReset);
-        removePipeline(pRenderer, pPipelinePersistentWave);
+        removePipeline(pRenderer, pPipelinePersistentWave256);
+        removePipeline(pRenderer, pPipelinePersistentWave128);
+        removePipeline(pRenderer, pPipelinePersistentWave64);
+        removePipeline(pRenderer, pPipelinePersistentStatic256);
+        removePipeline(pRenderer, pPipelinePersistentStatic128);
+        removePipeline(pRenderer, pPipelinePersistentStatic64);
+        removePipeline(pRenderer, pPipelinePersistentWavefrontReset);
+        removePipeline(pRenderer, pPipelinePersistentWavefront128);
+        removePipeline(pRenderer, pPipelinePersistentWavefront64);
+        removePipeline(pRenderer, pPipelinePersistentWavefront256);
     }
 
     void prepareDescriptorSets()
     {
-        DescriptorData perFrameParams[11] = {};
+        DescriptorData perFrameParams[13] = {};
         DescriptorData perBatchParams[5] = {};
 
         perFrameParams[0].mIndex = SRT_RES_IDX(SrtData, Persistent, gRtScene);
@@ -1396,6 +2181,10 @@ public:
         perFrameParams[9].ppBuffers = &pWavefrontQueueB;
         perFrameParams[10].mIndex = SRT_RES_IDX(SrtData, Persistent, gWavefrontCounters);
         perFrameParams[10].ppBuffers = &pWavefrontCounters;
+        perFrameParams[11].mIndex = SRT_RES_IDX(SrtData, Persistent, gWavefrontIndirectArgs);
+        perFrameParams[11].ppBuffers = &pWavefrontIndirectArgs;
+        perFrameParams[12].mIndex = SRT_RES_IDX(SrtData, Persistent, gWavefrontIndirectArgsB);
+        perFrameParams[12].ppBuffers = &pWavefrontIndirectArgsB;
 
         perBatchParams[0].mIndex = SRT_RES_IDX(SrtData, PerBatch, gOutput);
         perBatchParams[0].ppTextures = &pComputeOutput;
@@ -1420,7 +2209,7 @@ public:
 #endif
         for (uint32_t t = 0; t < RAYTRACING_TECHNIQUE_COUNT; ++t)
         {
-            updateDescriptorSet(pRenderer, 0, pDescriptorSetRaytracing[t], 11, perFrameParams);
+            updateDescriptorSet(pRenderer, 0, pDescriptorSetRaytracing[t], 13, perFrameParams);
             updateDescriptorSet(pRenderer, 0, pDescriptorSetRaytracingPerBatch[t], paramIndex, perBatchParams);
 
             for (uint32_t i = 0; i < gDataBufferCount; ++i)
@@ -1483,8 +2272,24 @@ private:
     Shader*                pShaderWavefrontBounce0 = NULL;
     Shader*                pShaderWavefrontBounce1 = NULL;
     Shader*                pShaderWavefrontResolve = NULL;
+    Shader*                pShaderWavefrontResetA = NULL;
+    Shader*                pShaderWavefrontResetB = NULL;
+    Shader*                pShaderWavefrontV2Reset = NULL;
+    Shader*                pShaderWavefrontV2ResetB = NULL;
+    Shader*                pShaderWavefrontV2Primary = NULL;
+    Shader*                pShaderWavefrontV2Secondary = NULL;
+    Shader*                pShaderWavefrontV2SecondaryB = NULL;
     Shader*                pShaderPersistentReset = NULL;
-    Shader*                pShaderPersistentWave = NULL;
+    Shader*                pShaderPersistentWave256 = NULL;
+    Shader*                pShaderPersistentWave128 = NULL;
+    Shader*                pShaderPersistentWave64 = NULL;
+    Shader*                pShaderPersistentStatic256 = NULL;
+    Shader*                pShaderPersistentStatic128 = NULL;
+    Shader*                pShaderPersistentStatic64 = NULL;
+    Shader*                pShaderPersistentWavefrontReset = NULL;
+    Shader*                pShaderPersistentWavefront64 = NULL;
+    Shader*                pShaderPersistentWavefront128 = NULL;
+    Shader*                pShaderPersistentWavefront256 = NULL;
     Shader*                pDisplayTextureShader = NULL;
     DescriptorSet*         pDescriptorSetRaytracing[RAYTRACING_TECHNIQUE_COUNT] = {};
     DescriptorSet*         pDescriptorSetRaytracingPerBatch[RAYTRACING_TECHNIQUE_COUNT] = {};
@@ -1495,8 +2300,24 @@ private:
     Pipeline*              pPipelineWavefrontBounce0 = NULL;
     Pipeline*              pPipelineWavefrontBounce1 = NULL;
     Pipeline*              pPipelineWavefrontResolve = NULL;
+    Pipeline*              pPipelineWavefrontResetA = NULL;
+    Pipeline*              pPipelineWavefrontResetB = NULL;
+    Pipeline*              pPipelineWavefrontV2Reset = NULL;
+    Pipeline*              pPipelineWavefrontV2ResetB = NULL;
+    Pipeline*              pPipelineWavefrontV2Primary = NULL;
+    Pipeline*              pPipelineWavefrontV2Secondary = NULL;
+    Pipeline*              pPipelineWavefrontV2SecondaryB = NULL;
     Pipeline*              pPipelinePersistentReset = NULL;
-    Pipeline*              pPipelinePersistentWave = NULL;
+    Pipeline*              pPipelinePersistentWave256 = NULL;
+    Pipeline*              pPipelinePersistentWave128 = NULL;
+    Pipeline*              pPipelinePersistentWave64 = NULL;
+    Pipeline*              pPipelinePersistentStatic256 = NULL;
+    Pipeline*              pPipelinePersistentStatic128 = NULL;
+    Pipeline*              pPipelinePersistentStatic64 = NULL;
+    Pipeline*              pPipelinePersistentWavefrontReset = NULL;
+    Pipeline*              pPipelinePersistentWavefront64 = NULL;
+    Pipeline*              pPipelinePersistentWavefront128 = NULL;
+    Pipeline*              pPipelinePersistentWavefront256 = NULL;
     Pipeline*              pDisplayTexturePipeline = NULL;
     SwapChain*             pSwapChain = NULL;
     Texture*               pComputeOutput = NULL;
@@ -1504,12 +2325,27 @@ private:
     Buffer*                pWavefrontQueueA = NULL;
     Buffer*                pWavefrontQueueB = NULL;
     Buffer*                pWavefrontCounters = NULL;
+    Buffer*                pWavefrontIndirectArgs = NULL;
+    Buffer*                pWavefrontIndirectArgsB = NULL;
     Semaphore*             pImageAcquiredSemaphore = NULL;
     uint32_t               mFrameIdx = 0;
     PathTracingData        mPathTracingData = {};
     UIComponent*           pGuiWindow = NULL;
     DynamicUIWidgets       mDynamicWidgets[2] = {};
     float3                 mLightDirection = float3(0.2f, 1.8f, 0.1f);
+    ProfileToken            mRaytracingGpuProfileToken = {};
+    BenchmarkPhase          mBenchmarkPhase = BENCHMARK_IDLE;
+    BenchmarkConfig         mBenchmarkConfigs[32] = {};
+    uint32_t                mBenchmarkConfigCount = 0;
+    uint32_t                mBenchmarkConfigIndex = 0;
+    uint32_t                mBenchmarkFrameCount = 0;
+    int64_t                 mBenchmarkStartUsec = 0;
+    double                  mBenchmarkGpuTimeSum = 0.0;
+    uint32_t                mBenchmarkSavedTechnique = RAY_QUERY;
+    uint32_t                mBenchmarkSavedGroupPreset = 2;
+    uint32_t                mBenchmarkSavedSchedulingMode = 0;
+    uint32_t                mBenchmarkSavedBatchPreset = 0;
+    uint32_t                mBenchmarkSavedWavefrontGroupPreset = 1;
 
 #if USE_DENOISER
     Texture*       pAlbedoTexture = NULL;
@@ -1523,5 +2359,19 @@ private:
     SSVGFDenoiser* pDenoiser = NULL;
 #endif
 };
+
+static void startRaytracingBenchmark(void* pUserData)
+{
+    UNREF_PARAM(pUserData);
+    if (gRaytracingApp)
+        gRaytracingApp->startBenchmark();
+}
+
+static void saveRaytracingBenchmark(void* pUserData)
+{
+    UNREF_PARAM(pUserData);
+    if (gRaytracingApp)
+        gRaytracingApp->saveBenchmark();
+}
 
 DEFINE_APPLICATION_MAIN(UnitTest_NativeRaytracing)

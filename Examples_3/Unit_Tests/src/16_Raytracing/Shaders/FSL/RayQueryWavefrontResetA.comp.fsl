@@ -4,7 +4,6 @@ NUM_THREADS(1, 1, 1)
 void CS_MAIN(SV_DispatchThreadID(uint) tid)
 {
     INIT_MAIN;
-    gWavefrontCounters[1] = 0;
-    gWavefrontCounters[2] = 0;
+    gWavefrontCounters[0] = 0;
     RETURN();
 }

@@ -4,13 +4,12 @@ void TraceWholePath(uint pixelIndex)
 {
     uint2 pixel = uint2(pixelIndex % gSettings.mWidth, pixelIndex / gSettings.mWidth);
     RayDesc ray = GenerateCameraRay(pixel);
-
     float3 throughput = f3(1.0f);
     float3 radiance = f3(0.0f);
     float3 primaryAlbedo = f3(0.0f);
 
-    UNROLL
-    for (uint bounce = 0; bounce < WF_MAX_BOUNCES; ++bounce)
+    LOOP
+    for (uint bounce = 0; bounce < gSettings.mMaxBounces; ++bounce)
     {
         SurfaceHit hit = TraceClosestSurface(ray);
         if (hit.hit == 0)
@@ -19,10 +18,7 @@ void TraceWholePath(uint pixelIndex)
             radiance += throughput * float3(0.3f, 0.6f, 1.2f);
             break;
         }
-
-        if (bounce == 0)
-            primaryAlbedo = hit.matColor.rgb;
-
+        if (bounce == 0) primaryAlbedo = hit.matColor.rgb;
         float3 rayOrigin = hit.position + hit.normal * 0.001f;
         float3 lightDir = gSettings.mLightDirection;
         if (!TraceShadowRay(rayOrigin, lightDir))
@@ -30,41 +26,40 @@ void TraceWholePath(uint pixelIndex)
             float3 direct = 5.0f * saturate(dot(lightDir, hit.normal)) * hit.matColor.rgb * M_1_PI_F;
             radiance += throughput * direct;
         }
-
         throughput *= hit.matColor.rgb;
         ray.Origin = rayOrigin;
         ray.Direction = GenerateBounceDirection(pixelIndex, bounce, hit.normal);
     }
-
     AccumulateOutput(pixel, radiance, primaryAlbedo);
 }
 
 ROOT_SIGNATURE(ComputeRootSignature)
-NUM_THREADS(256, 1, 1)
+NUM_THREADS(128, 1, 1)
 void CS_MAIN(SV_DispatchThreadID(uint) tid)
 {
     INIT_MAIN;
-
     uint lane = WaveGetLaneIndex();
     uint waveSize = WaveGetLaneCount();
     uint pixelCount = gSettings.mWidth * gSettings.mHeight;
+    uint batchSize = gSettings.mPersistentBatchSize;
 
     LOOP
     while (true)
     {
         uint base = 0;
         if (WaveIsFirstLane())
-            AtomicAdd(gWavefrontCounters[2], waveSize, base);
-
+            AtomicAdd(gWavefrontCounters[2], waveSize * batchSize, base);
         base = WaveReadLaneFirst(base);
-        uint pixelIndex = base + lane;
-
         if (base >= pixelCount)
             break;
 
-        if (pixelIndex < pixelCount)
-            TraceWholePath(pixelIndex);
+        LOOP
+        for (uint batch = 0; batch < batchSize; ++batch)
+        {
+            uint pixelIndex = base + batch * waveSize + lane;
+            if (pixelIndex < pixelCount)
+                TraceWholePath(pixelIndex);
+        }
     }
-
     RETURN();
 }

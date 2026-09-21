@@ -58,26 +58,136 @@
 #include "RayQuery.comp.fsl"
 #end
 
-#comp FT_RAYTRACING RayQueryWavefrontResolve.comp
-#include "RayQueryWavefrontResolve.comp.fsl"
-#end
-
-#comp FT_RAYTRACING RayQueryPersistentReset.comp
-#include "RayQueryPersistentReset.comp.fsl"
-#end
-
-#comp FT_RAYTRACING RayQueryPersistentWave.comp
-#include "RayQueryPersistentWave.comp.fsl"
+#comp FT_RAYTRACING RayQueryWavefrontGenerate.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryWavefrontGenerate.comp.fsl"
 #end
 
 #comp FT_RAYTRACING RayQueryWavefrontBounce0.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
 #include "RayQueryWavefrontBounce0.comp.fsl"
 #end
 
 #comp FT_RAYTRACING RayQueryWavefrontBounce1.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
 #include "RayQueryWavefrontBounce1.comp.fsl"
 #end
 
-#comp FT_RAYTRACING RayQueryWavefrontGenerate.comp
-#include "RayQueryWavefrontGenerate.comp.fsl"
+#comp FT_RAYTRACING RayQueryWavefrontResetA.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryWavefrontResetA.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryWavefrontResetB.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryWavefrontResetB.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryWavefrontResolve.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryWavefrontResolve.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryWavefrontV2Reset.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryWavefrontV2Reset.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryWavefrontV2ResetB.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryWavefrontV2ResetB.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryWavefrontV2Primary.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryWavefrontV2Primary.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryWavefrontV2Secondary.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryWavefrontV2Secondary.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryWavefrontV2SecondaryB.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryWavefrontV2SecondaryB.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryPersistentReset.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryPersistentReset.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryPersistentWave64.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryPersistentWave64.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryPersistentWave128.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryPersistentWave128.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryPersistentWave256.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryPersistentWave256.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryPersistentStatic64.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryPersistentStatic64.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryPersistentStatic128.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryPersistentStatic128.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryPersistentStatic256.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryPersistentStatic256.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryPersistentWavefrontReset.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryPersistentWavefrontReset.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryPersistentWavefront128.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryPersistentWavefront128.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryPersistentWavefront64.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#define PWF_THREAD_GROUP_SIZE 64
+#include "RayQueryPersistentWavefront128.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryPersistentWavefront256.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#define PWF_THREAD_GROUP_SIZE 256
+#include "RayQueryPersistentWavefront128.comp.fsl"
 #end

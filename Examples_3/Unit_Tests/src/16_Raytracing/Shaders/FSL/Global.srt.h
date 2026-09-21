@@ -33,6 +33,20 @@ BEGIN_SRT(SrtData)
         DECL_BUFFER(Persistent, ByteBuffer, gVertexTexCoordBuffer)
 	    DECL_BUFFER(Persistent, ByteBuffer, gIndexOffsets)
         DECL_ARRAY_TEXTURES(Persistent, Tex2D(float4), gMaterialTextures, TOTAL_IMGS)
+        // Experimental scheduling resources shared by the Wavefront and Persistent-Wave paths.
+        // The allocation is 10 float4 per pixel: enough for two ping-pong banks
+        // of 5 float4 compact continuation state. Wavefront V1 uses only the
+        // first 5-float4 bank with pixel-indexed path IDs.
+        DECL_RWBUFFER(Persistent, RWBuffer(float4), gWavefrontPathState)
+        DECL_RWBUFFER(Persistent, RWBuffer(uint),   gWavefrontQueueA)
+        DECL_RWBUFFER(Persistent, RWBuffer(uint),   gWavefrontQueueB)
+        // Generic scheduling counter storage. Different techniques assign
+        // different meanings to the first entries; Persistent Wavefront uses
+        // 0..24 for per-bounce heads/counts/outstanding state.
+        DECL_RWBUFFER(Persistent, RWBuffer(uint),   gWavefrontCounters)
+        // Ping-pong uint3 dispatch arguments for Wavefront V2 continuation passes.
+        DECL_RWBUFFER(Persistent, RWBuffer(uint),   gWavefrontIndirectArgs)
+        DECL_RWBUFFER(Persistent, RWBuffer(uint),   gWavefrontIndirectArgsB)
     END_SRT_SET(Persistent)
     BEGIN_SRT_SET(PerFrame)
         DECL_CBUFFER(PerFrame, CBUFFER(ShadersConfigBlock), gSettings)

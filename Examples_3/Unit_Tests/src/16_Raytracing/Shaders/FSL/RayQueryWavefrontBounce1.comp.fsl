@@ -8,7 +8,6 @@ void CS_MAIN(SV_DispatchThreadID(uint) tid)
 
     uint queueCount = gWavefrontCounters[1];
 
-    // FSL only allows RETURN() as the final line of the shader entry point.
     if (tid < queueCount)
     {
         uint pathId = gWavefrontQueueB[tid];
@@ -26,16 +25,13 @@ void CS_MAIN(SV_DispatchThreadID(uint) tid)
         if (active >= 0.5f)
         {
             SurfaceHit hit = TraceClosestSurface(ray);
+            bool continuePath = false;
 
             if (hit.hit == 0)
             {
-                radiance += throughput * float3(0.3f, 0.6f, 1.2f);
-
                 if (bounce == 0)
                     primaryAlbedo = f3(1.0f);
-
-                StorePath(pathId, ray, throughput, bounce,
-                          radiance, pixelIndex, primaryAlbedo, 0.0f);
+                radiance += throughput * float3(0.3f, 0.6f, 1.2f);
             }
             else
             {
@@ -44,36 +40,37 @@ void CS_MAIN(SV_DispatchThreadID(uint) tid)
 
                 float3 rayOrigin = hit.position + hit.normal * 0.001f;
                 float3 lightDir = gSettings.mLightDirection;
-
                 if (!TraceShadowRay(rayOrigin, lightDir))
                 {
                     float3 direct =
-                        5.0f *
-                        saturate(dot(lightDir, hit.normal)) *
-                        hit.matColor.rgb *
-                        M_1_PI_F;
-
+                        5.0f * saturate(dot(lightDir, hit.normal)) *
+                        hit.matColor.rgb * M_1_PI_F;
                     radiance += throughput * direct;
                 }
 
-                throughput *= hit.matColor.rgb;
-
-                uint nextBounce = bounce + 1;
-
-                if (nextBounce >= WF_MAX_BOUNCES)
+                if (bounce + 1u < gSettings.mMaxBounces)
                 {
-                    StorePath(pathId, ray, throughput, nextBounce,
-                              radiance, pixelIndex, primaryAlbedo, 0.0f);
-                }
-                else
-                {
+                    throughput *= hit.matColor.rgb;
                     ray.Origin = rayOrigin;
                     ray.Direction = GenerateBounceDirection(pixelIndex, bounce, hit.normal);
-
-                    StorePath(pathId, ray, throughput, nextBounce,
-                              radiance, pixelIndex, primaryAlbedo, 1.0f);
-
+                    ++bounce;
+                    continuePath = true;
                 }
+            }
+
+            if (continuePath)
+            {
+                StorePath(pathId, ray, throughput, bounce,
+                          radiance, pixelIndex, primaryAlbedo, 1.0f);
+
+                uint outSlot;
+                AtomicAdd(gWavefrontCounters[0], 1, outSlot);
+                gWavefrontQueueA[outSlot] = pathId;
+            }
+            else
+            {
+                StorePath(pathId, ray, throughput, bounce,
+                          radiance, pixelIndex, primaryAlbedo, 0.0f);
             }
         }
     }

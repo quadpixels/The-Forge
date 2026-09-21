@@ -1,0 +1,125 @@
+#include "RayQuerySchedulingCommon.fsl"
+
+#define V2_STATE_STRIDE 5
+
+void StoreV2Continuation(uint bank, uint slot, float3 origin, float3 direction,
+                         float3 throughput, float3 radiance,
+                         float3 primaryAlbedo, uint pixelIndex, uint bounce)
+{
+    uint pixelCount = gSettings.mWidth * gSettings.mHeight;
+    uint b = (bank * pixelCount + slot) * V2_STATE_STRIDE;
+    gWavefrontPathState[b + 0] = float4(origin, asfloat(pixelIndex));
+    gWavefrontPathState[b + 1] = float4(direction, throughput.x);
+    gWavefrontPathState[b + 2] = float4(throughput.y, throughput.z, radiance.x, radiance.y);
+    gWavefrontPathState[b + 3] = float4(radiance.z, primaryAlbedo);
+    gWavefrontPathState[b + 4] = float4(asfloat(bounce), 0.0f, 0.0f, 0.0f);
+}
+
+void LoadV2Continuation(uint bank, uint slot, out RayDesc ray,
+                        out float3 throughput, out float3 radiance,
+                        out float3 primaryAlbedo, out uint pixelIndex, out uint bounce)
+{
+    uint pixelCount = gSettings.mWidth * gSettings.mHeight;
+    uint b = (bank * pixelCount + slot) * V2_STATE_STRIDE;
+    float4 s0 = gWavefrontPathState[b + 0];
+    float4 s1 = gWavefrontPathState[b + 1];
+    float4 s2 = gWavefrontPathState[b + 2];
+    float4 s3 = gWavefrontPathState[b + 3];
+    float4 s4 = gWavefrontPathState[b + 4];
+
+    ray.Origin = s0.xyz;
+    ray.TMin = 0.001f;
+    pixelIndex = asuint(s0.w);
+    ray.Direction = s1.xyz;
+    ray.TMax = 10000.0f;
+    throughput = float3(s1.w, s2.x, s2.y);
+    radiance = float3(s2.z, s2.w, s3.x);
+    primaryAlbedo = s3.yzw;
+    bounce = asuint(s4.x);
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(64, 1, 1)
+void CS_MAIN(SV_DispatchThreadID(uint) tid)
+{
+    INIT_MAIN;
+
+    uint pixelCount = gSettings.mWidth * gSettings.mHeight;
+    if (tid < pixelCount)
+    {
+        uint pixelIndex = tid;
+        uint2 pixel = uint2(pixelIndex % gSettings.mWidth, pixelIndex / gSettings.mWidth);
+
+        RayDesc ray = GenerateCameraRay(pixel);
+        float3 throughput = f3(1.0f);
+        float3 radiance = f3(0.0f);
+        float3 primaryAlbedo = f3(0.0f);
+
+        SurfaceHit hit = TraceClosestSurface(ray);
+        bool continuePath = false;
+        float3 nextOrigin = f3(0.0f);
+        float3 nextDirection = f3(0.0f);
+
+        if (hit.hit == 0)
+        {
+            primaryAlbedo = f3(1.0f);
+            radiance += float3(0.3f, 0.6f, 1.2f);
+            AccumulateOutput(pixel, radiance, primaryAlbedo);
+        }
+        else
+        {
+            primaryAlbedo = hit.matColor.rgb;
+            float3 rayOrigin = hit.position + hit.normal * 0.001f;
+            float3 lightDir = gSettings.mLightDirection;
+
+            if (!TraceShadowRay(rayOrigin, lightDir))
+            {
+                float3 direct =
+                    5.0f * saturate(dot(lightDir, hit.normal)) *
+                    hit.matColor.rgb * M_1_PI_F;
+                radiance += direct;
+            }
+
+            if (gSettings.mMaxBounces > 1u)
+            {
+                throughput *= hit.matColor.rgb;
+                nextOrigin = rayOrigin;
+                nextDirection = GenerateBounceDirection(pixelIndex, 0, hit.normal);
+                continuePath = true;
+            }
+            else
+            {
+                AccumulateOutput(pixel, radiance, primaryAlbedo);
+            }
+        }
+
+        uint appendCount = WaveActiveCountBits(continuePath);
+        uint appendBase = 0;
+        if (WaveIsFirstLane() && appendCount > 0)
+            AtomicAdd(gWavefrontCounters[0], appendCount, appendBase);
+        appendBase = WaveReadLaneFirst(appendBase);
+
+        if (WaveIsFirstLane() && appendCount > 0)
+        {
+            uint oldGroups = (appendBase + 63u) / 64u;
+            uint newGroups = (appendBase + appendCount + 63u) / 64u;
+            uint addedGroups = newGroups - oldGroups;
+            if (addedGroups > 0)
+            {
+                uint ignored;
+                AtomicAdd(gWavefrontIndirectArgs[0], addedGroups, ignored);
+            }
+        }
+
+        uint appendOffset = WavePrefixCountBits(continuePath);
+        if (continuePath)
+        {
+            StoreV2Continuation(0, appendBase + appendOffset,
+                                nextOrigin, nextDirection,
+                                throughput, radiance,
+                                primaryAlbedo, pixelIndex, 1u);
+        }
+    }
+
+    RETURN();
+}

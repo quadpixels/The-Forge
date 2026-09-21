@@ -5,6 +5,8 @@ void CS_MAIN(SV_DispatchThreadID(uint) tid)
 {
     INIT_MAIN;
     gWavefrontCounters[1] = 0;
-    gWavefrontCounters[2] = 0;
+    gWavefrontIndirectArgsB[0] = 0;
+    gWavefrontIndirectArgsB[1] = 1;
+    gWavefrontIndirectArgsB[2] = 1;
     RETURN();
 }

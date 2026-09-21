@@ -1,0 +1,25 @@
+#include "RayQuerySchedulingCommon.fsl"
+
+// Generic persistent-wavefront counter layout, supporting up to 8 bounces:
+// [ 0.. 7] dequeue head for bounce b
+// [ 8..15] work count for bounce b
+// [16..23] outstanding tasks for bounce b
+// [24]     highest bounce phase whose input queue is finalized/ready
+// [25..31] reserved
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(1, 1, 1)
+void CS_MAIN(SV_DispatchThreadID(uint) tid)
+{
+    INIT_MAIN;
+
+    LOOP
+    for (uint i = 0; i < 32u; ++i)
+        gWavefrontCounters[i] = 0;
+
+    uint pixelCount = gSettings.mWidth * gSettings.mHeight;
+    gWavefrontCounters[8] = pixelCount;
+    gWavefrontCounters[16] = pixelCount;
+    gWavefrontCounters[24] = 0;
+
+    RETURN();
+}

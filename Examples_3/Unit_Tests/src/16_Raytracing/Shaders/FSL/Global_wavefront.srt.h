@@ -34,17 +34,19 @@ BEGIN_SRT(SrtData)
 	    DECL_BUFFER(Persistent, ByteBuffer, gIndexOffsets)
         DECL_ARRAY_TEXTURES(Persistent, Tex2D(float4), gMaterialTextures, TOTAL_IMGS)
         // Experimental scheduling resources shared by the Wavefront and Persistent-Wave paths.
-        // gWavefrontPathState stores 5 float4 values per pixel/path:
-        //   0: ray origin.xyz, TMin
-        //   1: ray direction.xyz, TMax
-        //   2: throughput.xyz, bounce(asfloat(uint))
-        //   3: radiance.xyz, pixelIndex(asfloat(uint))
-        //   4: primaryAlbedo.xyz, active(0/1)
+        // The allocation is 10 float4 per pixel: enough for two ping-pong banks
+        // of 5 float4 compact continuation state. Wavefront V1 uses only the
+        // first 5-float4 bank with pixel-indexed path IDs.
         DECL_RWBUFFER(Persistent, RWBuffer(float4), gWavefrontPathState)
         DECL_RWBUFFER(Persistent, RWBuffer(uint),   gWavefrontQueueA)
         DECL_RWBUFFER(Persistent, RWBuffer(uint),   gWavefrontQueueB)
-        // [0] queue A count, [1] queue B count, [2] persistent work head, [3] reserved
+        // Generic scheduling counter storage. Different techniques assign
+        // different meanings to the first entries; Persistent Wavefront uses
+        // 0..24 for per-bounce heads/counts/outstanding state.
         DECL_RWBUFFER(Persistent, RWBuffer(uint),   gWavefrontCounters)
+        // Ping-pong uint3 dispatch arguments for Wavefront V2 continuation passes.
+        DECL_RWBUFFER(Persistent, RWBuffer(uint),   gWavefrontIndirectArgs)
+        DECL_RWBUFFER(Persistent, RWBuffer(uint),   gWavefrontIndirectArgsB)
     END_SRT_SET(Persistent)
     BEGIN_SRT_SET(PerFrame)
         DECL_CBUFFER(PerFrame, CBUFFER(ShadersConfigBlock), gSettings)

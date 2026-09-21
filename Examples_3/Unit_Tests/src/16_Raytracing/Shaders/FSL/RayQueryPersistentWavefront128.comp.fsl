@@ -1,0 +1,246 @@
+#include "RayQuerySchedulingCommon.fsl"
+
+#define PWF_STATE_STRIDE 5
+#define PWF_MAX_UI_BOUNCES 8
+
+// Two compact continuation banks. A continuation created by bounce b is stored
+// in bank (b & 1) and consumed by bounce (b + 1).
+void StorePwfContinuation(uint bank, uint slot,
+                          float3 origin, float3 direction,
+                          float3 throughput, float3 radiance,
+                          float3 primaryAlbedo, uint pixelIndex)
+{
+    uint pixelCount = gSettings.mWidth * gSettings.mHeight;
+    uint b = (bank * pixelCount + slot) * PWF_STATE_STRIDE;
+    gWavefrontPathState[b + 0] = float4(origin, asfloat(pixelIndex));
+    gWavefrontPathState[b + 1] = float4(direction, throughput.x);
+    gWavefrontPathState[b + 2] = float4(throughput.y, throughput.z, radiance.x, radiance.y);
+    gWavefrontPathState[b + 3] = float4(radiance.z, primaryAlbedo);
+    gWavefrontPathState[b + 4] = f4(0.0f);
+}
+
+void LoadPwfContinuation(uint bank, uint slot,
+                         out RayDesc ray,
+                         out float3 throughput, out float3 radiance,
+                         out float3 primaryAlbedo, out uint pixelIndex)
+{
+    uint pixelCount = gSettings.mWidth * gSettings.mHeight;
+    uint b = (bank * pixelCount + slot) * PWF_STATE_STRIDE;
+    float4 s0 = gWavefrontPathState[b + 0];
+    float4 s1 = gWavefrontPathState[b + 1];
+    float4 s2 = gWavefrontPathState[b + 2];
+    float4 s3 = gWavefrontPathState[b + 3];
+
+    ray.Origin = s0.xyz;
+    ray.TMin = 0.001f;
+    pixelIndex = asuint(s0.w);
+    ray.Direction = s1.xyz;
+    ray.TMax = 10000.0f;
+    throughput = float3(s1.w, s2.x, s2.y);
+    radiance = float3(s2.z, s2.w, s3.x);
+    primaryAlbedo = s3.yzw;
+}
+
+uint AtomicReadCounter(uint index)
+{
+    uint value;
+    AtomicAdd(gWavefrontCounters[index], 0u, value);
+    return value;
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+#ifndef PWF_THREAD_GROUP_SIZE
+#define PWF_THREAD_GROUP_SIZE 128
+#endif
+NUM_THREADS(PWF_THREAD_GROUP_SIZE, 1, 1)
+void CS_MAIN(SV_DispatchThreadID(uint) tid)
+{
+    INIT_MAIN;
+
+    uint lane = WaveGetLaneIndex();
+    uint waveSize = WaveGetLaneCount();
+    uint pixelCount = gSettings.mWidth * gSettings.mHeight;
+
+    // UI limits mMaxBounces to <= 8. Clamp defensively in the shader as well.
+    uint maxBounces = min(gSettings.mMaxBounces, 8u);
+
+    LOOP
+    for (uint bounce = 0; bounce < maxBounces; ++bounce)
+    {
+        // bounce 0 is ready immediately. Later bounce queues are finalized by
+        // the last completing wave of the preceding bounce.
+        if (bounce > 0)
+        {
+            LOOP
+            while (true)
+            {
+                uint readyPhase = 0;
+                if (WaveIsFirstLane())
+                    readyPhase = AtomicReadCounter(24);
+                readyPhase = WaveReadLaneFirst(readyPhase);
+
+                if (readyPhase >= bounce)
+                    break;
+            }
+            DeviceMemoryBarrier();
+        }
+
+        uint workCount = AtomicReadCounter(8 + bounce);
+        if (workCount == 0)
+            break; // no survivors => no later bounce can contain work
+
+        LOOP
+        while (true)
+        {
+            uint base = 0;
+            if (WaveIsFirstLane())
+                AtomicAdd(gWavefrontCounters[bounce], waveSize, base);
+            base = WaveReadLaneFirst(base);
+
+            if (base >= workCount)
+                break;
+
+            uint slot = base + lane;
+            bool validPath = slot < workCount;
+            bool continuePath = false;
+
+            RayDesc ray;
+            float3 throughput = f3(1.0f);
+            float3 radiance = f3(0.0f);
+            float3 primaryAlbedo = f3(0.0f);
+            uint pixelIndex = 0;
+
+            if (validPath)
+            {
+                if (bounce == 0)
+                {
+                    pixelIndex = slot;
+                    uint2 pixel = uint2(pixelIndex % gSettings.mWidth,
+                                        pixelIndex / gSettings.mWidth);
+                    ray = GenerateCameraRay(pixel);
+                }
+                else
+                {
+                    uint inputBank = (bounce - 1u) & 1u;
+                    LoadPwfContinuation(inputBank, slot, ray, throughput,
+                                        radiance, primaryAlbedo, pixelIndex);
+                }
+
+                SurfaceHit hit = TraceClosestSurface(ray);
+
+                if (hit.hit == 0)
+                {
+                    if (bounce == 0)
+                        primaryAlbedo = f3(1.0f);
+                    radiance += throughput * float3(0.3f, 0.6f, 1.2f);
+                }
+                else
+                {
+                    if (bounce == 0)
+                        primaryAlbedo = hit.matColor.rgb;
+
+                    float3 rayOrigin = hit.position + hit.normal * 0.001f;
+                    float3 lightDir = gSettings.mLightDirection;
+
+                    if (!TraceShadowRay(rayOrigin, lightDir))
+                    {
+                        float3 direct =
+                            5.0f * saturate(dot(lightDir, hit.normal)) *
+                            hit.matColor.rgb * M_1_PI_F;
+                        radiance += throughput * direct;
+                    }
+
+                    if (bounce + 1u < maxBounces)
+                    {
+                        throughput *= hit.matColor.rgb;
+                        ray.Origin = rayOrigin;
+                        ray.Direction =
+                            GenerateBounceDirection(pixelIndex, bounce, hit.normal);
+                        continuePath = true;
+                    }
+                }
+
+                if (!continuePath)
+                {
+                    uint2 pixel = uint2(pixelIndex % gSettings.mWidth,
+                                        pixelIndex / gSettings.mWidth);
+                    AccumulateOutput(pixel, radiance, primaryAlbedo);
+                }
+            }
+
+            // Compact survivors into the next bounce's dense queue/state bank.
+            uint appendCount =
+                WaveActiveCountBits(validPath && continuePath);
+            uint appendBase = 0;
+
+            if (WaveIsFirstLane() && appendCount > 0)
+                AtomicAdd(gWavefrontCounters[8 + bounce + 1u],
+                          appendCount, appendBase);
+
+            appendBase = WaveReadLaneFirst(appendBase);
+            uint appendOffset =
+                WavePrefixCountBits(validPath && continuePath);
+
+            if (validPath && continuePath)
+            {
+                uint outputBank = bounce & 1u;
+                StorePwfContinuation(
+                    outputBank,
+                    appendBase + appendOffset,
+                    ray.Origin, ray.Direction,
+                    throughput, radiance,
+                    primaryAlbedo, pixelIndex);
+            }
+
+            // Publish output state/count before declaring these current-bounce
+            // tasks complete.
+            DeviceMemoryBarrier();
+
+            uint completedCount = WaveActiveCountBits(validPath);
+            if (WaveIsFirstLane() && completedCount > 0)
+            {
+                uint previousOutstanding;
+                AtomicAdd(gWavefrontCounters[16 + bounce],
+                          0u - completedCount,
+                          previousOutstanding);
+
+                // The wave that observes the final decrement finalizes the next
+                // bounce. Separate per-bounce heads mean groups that become
+                // resident late cannot mistake a later phase for bounce 0.
+                if (previousOutstanding == completedCount)
+                {
+                    DeviceMemoryBarrier();
+
+                    if (bounce + 1u < maxBounces)
+                    {
+                        uint nextCount =
+                            AtomicReadCounter(8 + bounce + 1u);
+                        gWavefrontCounters[16 + bounce + 1u] = nextCount;
+                    }
+
+                    gWavefrontCounters[24] = bounce + 1u;
+                }
+            }
+        }
+
+        // Waves that ran out of current work early wait for the last worker to
+        // finalize this phase before entering the next bounce.
+        if (bounce + 1u < maxBounces)
+        {
+            LOOP
+            while (true)
+            {
+                uint readyPhase = 0;
+                if (WaveIsFirstLane())
+                    readyPhase = AtomicReadCounter(24);
+                readyPhase = WaveReadLaneFirst(readyPhase);
+
+                if (readyPhase >= bounce + 1u)
+                    break;
+            }
+            DeviceMemoryBarrier();
+        }
+    }
+
+    RETURN();
+}
