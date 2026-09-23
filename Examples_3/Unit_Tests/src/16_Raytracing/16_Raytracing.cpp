@@ -471,6 +471,12 @@ public:
             {
                 mSettings.mFullScreen = true;
             }
+            else if (strcmp(argv[i], "-preset") == 0 && i + 1 < argc)
+            {
+                const int presetNumber = atoi(argv[i + 1]);
+                if (presetNumber >= 1 && presetNumber <= (int)TF_ARRAY_COUNT(gRaytracingPresets))
+                    applyRaytracingPreset((void*)&gRaytracingPresets[presetNumber - 1]);
+            }
         }
     }
 
