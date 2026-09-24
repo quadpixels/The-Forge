@@ -148,6 +148,27 @@
 #include "RayQueryPersistentWave256.comp.fsl"
 #end
 
+#comp FT_RAYTRACING RayQueryPersistentTile256.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#include "RayQueryPersistentTile256.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryPersistentTileZLocal256.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#define PERSISTENT_TILE_Z_LOCAL 1
+#include "RayQueryPersistentTile256.comp.fsl"
+#end
+
+#comp FT_RAYTRACING RayQueryPersistentTileZZ256.comp
+#define UAV_RW_FALLBACK 0
+#define DENOISER_ENABLED 0
+#define PERSISTENT_TILE_Z_LOCAL 1
+#define PERSISTENT_TILE_Z_TILES 1
+#include "RayQueryPersistentTile256.comp.fsl"
+#end
+
 #comp FT_RAYTRACING RayQueryPersistentStatic64.comp
 #define UAV_RW_FALLBACK 0
 #define DENOISER_ENABLED 0

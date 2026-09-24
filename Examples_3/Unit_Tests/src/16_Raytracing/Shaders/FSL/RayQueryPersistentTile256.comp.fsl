@@ -1,0 +1,135 @@
+#include "RayQuerySchedulingCommon.fsl"
+
+#define PERSISTENT_TILE_SIZE 256u
+
+#ifndef PERSISTENT_TILE_Z_LOCAL
+#define PERSISTENT_TILE_Z_LOCAL 0
+#endif
+
+#ifndef PERSISTENT_TILE_Z_TILES
+#define PERSISTENT_TILE_Z_TILES 0
+#endif
+
+uint CompactMortonBits(uint value)
+{
+    // Keep enough bits for a tile height of 512 (9 coordinate bits).
+    value &= 0x55555555u;
+    value = (value ^ (value >> 1u)) & 0x33333333u;
+    value = (value ^ (value >> 2u)) & 0x0F0F0F0Fu;
+    value = (value ^ (value >> 4u)) & 0x00FF00FFu;
+    value = (value ^ (value >> 8u)) & 0x0000FFFFu;
+    return value;
+}
+
+uint MortonDecodeX(uint code) { return CompactMortonBits(code); }
+uint MortonDecodeY(uint code) { return CompactMortonBits(code >> 1u); }
+
+uint NextPowerOfTwo(uint value)
+{
+    uint result = 1u;
+    while (result < value)
+        result <<= 1u;
+    return result;
+}
+
+void TraceWholePath(uint2 pixel)
+{
+    uint pixelIndex = pixel.y * gSettings.mWidth + pixel.x;
+    RayDesc ray = GenerateCameraRay(pixel);
+    float3 throughput = f3(1.0f);
+    float3 radiance = f3(0.0f);
+    float3 primaryAlbedo = f3(0.0f);
+
+    LOOP
+    for (uint bounce = 0; bounce < gSettings.mMaxBounces; ++bounce)
+    {
+        SurfaceHit hit = TraceClosestSurface(ray);
+        if (hit.hit == 0)
+        {
+            if (bounce == 0) primaryAlbedo = f3(1.0f);
+            radiance += throughput * float3(0.3f, 0.6f, 1.2f);
+            break;
+        }
+
+        if (bounce == 0) primaryAlbedo = hit.matColor.rgb;
+
+        float3 rayOrigin = hit.position + hit.normal * 0.001f;
+        float3 lightDir = gSettings.mLightDirection;
+        if (!TraceShadowRay(rayOrigin, lightDir))
+        {
+            float3 direct = 5.0f * saturate(dot(lightDir, hit.normal)) * hit.matColor.rgb * M_1_PI_F;
+            radiance += throughput * direct;
+        }
+
+        throughput *= hit.matColor.rgb;
+        ray.Origin = rayOrigin;
+        ray.Direction = GenerateBounceDirection(pixelIndex, bounce, hit.normal);
+    }
+
+    AccumulateOutput(pixel, radiance, primaryAlbedo);
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(256, 1, 1)
+void CS_MAIN(SV_GroupThreadID(uint3) threadInGroupId, SV_GroupID(uint3) groupId)
+{
+    INIT_MAIN;
+
+    const uint threadGroupSize = 256u;
+    const uint persistentWorkerGroups = max(1u, gSettings.mPersistentTotalThreads / threadGroupSize);
+    const uint tileWidth = threadGroupSize;
+    const uint tileHeight = persistentWorkerGroups;
+    const uint tileCountX = (gSettings.mWidth + tileWidth - 1u) / tileWidth;
+    const uint tileCountY = (gSettings.mHeight + tileHeight - 1u) / tileHeight;
+#if PERSISTENT_TILE_Z_TILES
+    const uint tileGridX = NextPowerOfTwo(tileCountX);
+    const uint tileGridY = NextPowerOfTwo(tileCountY);
+#else
+    const uint tileGridX = tileCountX;
+    const uint tileGridY = tileCountY;
+#endif
+    const uint tileArea = tileWidth * tileHeight;
+    const uint totalWorkItems = tileGridX * tileGridY * tileArea;
+    const uint totalThreads = threadGroupSize * persistentWorkerGroups;
+    const uint firstWorkItem = groupId.x * threadGroupSize + threadInGroupId.x;
+
+    // The worker space is linear. Each worker visits a grid-stride sequence
+    // of padded tile items, then decodes each item back to tile/local coords.
+    for (uint linearWorkItem = firstWorkItem; linearWorkItem < totalWorkItems; linearWorkItem += totalThreads)
+    {
+        const uint tileIndex = linearWorkItem / tileArea;
+        const uint localIndex = linearWorkItem % tileArea;
+
+        const uint tileX =
+#if PERSISTENT_TILE_Z_TILES
+            MortonDecodeX(tileIndex);
+#else
+            tileIndex % tileCountX;
+#endif
+        const uint tileY =
+#if PERSISTENT_TILE_Z_TILES
+            MortonDecodeY(tileIndex);
+#else
+            tileIndex / tileCountX;
+#endif
+        const uint localX =
+#if PERSISTENT_TILE_Z_LOCAL
+            MortonDecodeX(localIndex);
+#else
+            localIndex % tileWidth;
+#endif
+        const uint localY =
+#if PERSISTENT_TILE_Z_LOCAL
+            MortonDecodeY(localIndex);
+#else
+            localIndex / tileWidth;
+#endif
+
+        const uint pixelX = tileX * tileWidth + localX;
+        const uint pixelY = tileY * tileHeight + localY;
+        if (tileX < tileCountX && tileY < tileCountY && pixelX < gSettings.mWidth && pixelY < gSettings.mHeight)
+            TraceWholePath(uint2(pixelX, pixelY));
+    }
+
+    RETURN();
+}

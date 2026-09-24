@@ -67,6 +67,9 @@
 
 bool gUseUavRwFallback = false;
 
+uint32_t g_num_frames_drawn{0};
+uint32_t g_num_frames_to_draw{0};
+
 // Optional D3D12 profiling aid. Disabled by default.
 // SetStablePowerState generally requires Windows Developer Mode.
 bool gStablePowerState = false;
@@ -109,6 +112,9 @@ enum RaytracingTechnique
     PERSISTENT_WAVE_256_PATH_TRACING,
     PERSISTENT_WAVE_128_PATH_TRACING,
     PERSISTENT_WAVE_64_PATH_TRACING,
+    PERSISTENT_WAVE_256_TILE_PATH_TRACING,
+    PERSISTENT_WAVE_256_TILE_Z_LOCAL_PATH_TRACING,
+    PERSISTENT_WAVE_256_TILE_ZZ_PATH_TRACING,
     PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING,
     RAYTRACING_TECHNIQUE_COUNT
 };
@@ -240,6 +246,9 @@ public:
 
         if (gRaytracingTechnique != WAVEFRONT_V2_PATH_TRACING &&
             gRaytracingTechnique != PERSISTENT_WAVE_256_PATH_TRACING &&
+            gRaytracingTechnique != PERSISTENT_WAVE_256_TILE_PATH_TRACING &&
+            gRaytracingTechnique != PERSISTENT_WAVE_256_TILE_Z_LOCAL_PATH_TRACING &&
+            gRaytracingTechnique != PERSISTENT_WAVE_256_TILE_ZZ_PATH_TRACING &&
             gRaytracingTechnique != PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING)
         {
             mBenchmarkPhase = BENCHMARK_IDLE;
@@ -288,6 +297,13 @@ public:
                 for (uint32_t groupPreset = 0; groupPreset < TF_ARRAY_COUNT(gPersistentGroupCounts); ++groupPreset)
                     mBenchmarkConfigs[mBenchmarkConfigCount++] = { technique, threadGroupSizes[techniqueIndex], groupPreset };
             }
+        }
+        else if (gRaytracingTechnique == PERSISTENT_WAVE_256_TILE_PATH_TRACING ||
+                 gRaytracingTechnique == PERSISTENT_WAVE_256_TILE_Z_LOCAL_PATH_TRACING ||
+                 gRaytracingTechnique == PERSISTENT_WAVE_256_TILE_ZZ_PATH_TRACING)
+        {
+            for (uint32_t groupPreset = 0; groupPreset < TF_ARRAY_COUNT(gPersistentGroupCounts); ++groupPreset)
+                mBenchmarkConfigs[mBenchmarkConfigCount++] = { gRaytracingTechnique, 256, groupPreset };
         }
         else
         {
@@ -432,7 +448,10 @@ private:
         else
         {
             snprintf(resultLine, sizeof(resultLine), "%s,%u,%u,%.3f\n",
-                     config.mTechnique == PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING ? "Persistent Wavefront" : "Persistent Warp",
+                     config.mTechnique == PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING ? "Persistent Wavefront" :
+                     config.mTechnique == PERSISTENT_WAVE_256_TILE_ZZ_PATH_TRACING ? "Persistent Warp tiled ZTile ZLocal" :
+                     config.mTechnique == PERSISTENT_WAVE_256_TILE_Z_LOCAL_PATH_TRACING ? "Persistent Warp tiled ZLocal" :
+                     config.mTechnique == PERSISTENT_WAVE_256_TILE_PATH_TRACING ? "Persistent Warp 256x256 Tile" : "Persistent Warp",
                      config.mThreadGroupSize, gPersistentGroupCounts[config.mGroupPreset], mBenchmarkGpuTimeSum / 20.0);
         }
         bcatcstr(&gRaytracingBenchmarkTable, resultLine);
@@ -477,6 +496,12 @@ public:
                 if (presetNumber >= 1 && presetNumber <= (int)TF_ARRAY_COUNT(gRaytracingPresets))
                     applyRaytracingPreset((void*)&gRaytracingPresets[presetNumber - 1]);
             }
+            else if (strcmp(argv[i], "-nframe") == 0 && i + 1 < argc) {
+                int x = std::atoi(argv[i+1]);
+                if (x >= 0) {
+                    g_num_frames_to_draw = x;
+                }
+            }
         }
     }
 
@@ -510,6 +535,9 @@ public:
         gRaytracingTechniqueSupported[PERSISTENT_WAVE_256_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
         gRaytracingTechniqueSupported[PERSISTENT_WAVE_128_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
         gRaytracingTechniqueSupported[PERSISTENT_WAVE_64_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
+        gRaytracingTechniqueSupported[PERSISTENT_WAVE_256_TILE_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
+        gRaytracingTechniqueSupported[PERSISTENT_WAVE_256_TILE_Z_LOCAL_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
+        gRaytracingTechniqueSupported[PERSISTENT_WAVE_256_TILE_ZZ_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
         gRaytracingTechniqueSupported[PERSISTENT_WAVEFRONT_SINGLE_BOUNCE_PATH_TRACING] = pRenderer->pGpu->mRayQuerySupported;
 
         gUseUavRwFallback = !(pRenderer->pGpu->mFormatCaps[TinyImageFormat_R16G16B16A16_SFLOAT] & FORMAT_CAP_READ_WRITE);
@@ -823,6 +851,9 @@ public:
                 "Persistent Warps (TG256)",
                 "Persistent Warps (TG128)",
                 "Persistent Warps (TG64)",
+                "Persistent Warp (256x256 Tile, TG256)",
+                "Persistent Warp tiled + ZLocal",
+                "Persistent Warp tiled + ZTile + ZLocal",
                 "Persistent Wavefront (1 Bounce/Task, TG128)",
             };
             COMPILE_ASSERT(TF_ARRAY_COUNT(raytracingOptions) == RAYTRACING_TECHNIQUE_COUNT);
@@ -1354,9 +1385,18 @@ public:
                 persistentTgSizeForCB = 128;
             else if (PERSISTENT_WAVE_256_PATH_TRACING == gRaytracingTechnique)
                 persistentTgSizeForCB = 256;
+            else if (PERSISTENT_WAVE_256_TILE_PATH_TRACING == gRaytracingTechnique ||
+                     PERSISTENT_WAVE_256_TILE_Z_LOCAL_PATH_TRACING == gRaytracingTechnique ||
+                     PERSISTENT_WAVE_256_TILE_ZZ_PATH_TRACING == gRaytracingTechnique)
+                persistentTgSizeForCB = 256;
             const uint32_t persistentPixelCountForCB = mSettings.mWidth * mSettings.mHeight;
             const uint32_t persistentNormalGroupsForCB = round_up(persistentPixelCountForCB, persistentTgSizeForCB) / persistentTgSizeForCB;
-            const uint32_t persistentActualGroupsForCB = min(gPersistentGroupCounts[gPersistentGroupPreset], persistentNormalGroupsForCB);
+            const uint32_t persistentActualGroupsForCB =
+                (PERSISTENT_WAVE_256_TILE_PATH_TRACING == gRaytracingTechnique ||
+                 PERSISTENT_WAVE_256_TILE_Z_LOCAL_PATH_TRACING == gRaytracingTechnique ||
+                 PERSISTENT_WAVE_256_TILE_ZZ_PATH_TRACING == gRaytracingTechnique)
+                    ? gPersistentGroupCounts[gPersistentGroupPreset]
+                    : min(gPersistentGroupCounts[gPersistentGroupPreset], persistentNormalGroupsForCB);
             cb.mPersistentTotalThreads = persistentActualGroupsForCB * persistentTgSizeForCB;
 
             BufferUpdateDesc bufferUpdate = { pRayGenConfigBuffer[mFrameIdx] };
@@ -1620,6 +1660,26 @@ public:
                 cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
                 cmdDispatch(pCmd, persistentGroups, 1, 1);
             }
+            else if (PERSISTENT_WAVE_256_TILE_PATH_TRACING == gRaytracingTechnique ||
+                     PERSISTENT_WAVE_256_TILE_Z_LOCAL_PATH_TRACING == gRaytracingTechnique ||
+                     PERSISTENT_WAVE_256_TILE_ZZ_PATH_TRACING == gRaytracingTechnique)
+            {
+                // The shader uses the selected resident-group count both as
+                // the worker count and as the tile height.
+                const uint32_t persistentGroups = gPersistentGroupCounts[gPersistentGroupPreset];
+
+                Pipeline* pPersistentTilePipeline = pPipelinePersistentTile256;
+                if (PERSISTENT_WAVE_256_TILE_Z_LOCAL_PATH_TRACING == gRaytracingTechnique)
+                    pPersistentTilePipeline = pPipelinePersistentTileZLocal256;
+                else if (PERSISTENT_WAVE_256_TILE_ZZ_PATH_TRACING == gRaytracingTechnique)
+                    pPersistentTilePipeline = pPipelinePersistentTileZZ256;
+
+                cmdBindPipeline(pCmd, pPersistentTilePipeline);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracing[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, 0, pDescriptorSetRaytracingPerBatch[gRaytracingTechnique]);
+                cmdBindDescriptorSet(pCmd, mFrameIdx, pDescriptorSetUniforms[gRaytracingTechnique]);
+                cmdDispatch(pCmd, persistentGroups, 1, 1);
+            }
             else if (PERSISTENT_WAVE_256_PATH_TRACING == gRaytracingTechnique || PERSISTENT_WAVE_128_PATH_TRACING == gRaytracingTechnique ||
                      PERSISTENT_WAVE_64_PATH_TRACING == gRaytracingTechnique)
             {
@@ -1775,6 +1835,12 @@ public:
         mFrameIdx = (mFrameIdx + 1) % gDataBufferCount;
         /************************************************************************/
         /************************************************************************/
+
+        g_num_frames_drawn++;
+        if (g_num_frames_to_draw > 0 && g_num_frames_to_draw == g_num_frames_drawn) {
+            PostMessage(pWindow->handle.window, WM_QUIT, 0, 0);
+            
+        }
     }
 
     bool addSwapChain()
@@ -1895,6 +1961,18 @@ public:
             persistentWave256.mComp.pFileName = "RayQueryPersistentWave256.comp";
             addShader(pRenderer, &persistentWave256, &pShaderPersistentWave256);
 
+            ShaderLoadDesc persistentTile256 = {};
+            persistentTile256.mComp.pFileName = "RayQueryPersistentTile256.comp";
+            addShader(pRenderer, &persistentTile256, &pShaderPersistentTile256);
+
+            ShaderLoadDesc persistentTileZLocal256 = {};
+            persistentTileZLocal256.mComp.pFileName = "RayQueryPersistentTileZLocal256.comp";
+            addShader(pRenderer, &persistentTileZLocal256, &pShaderPersistentTileZLocal256);
+
+            ShaderLoadDesc persistentTileZZ256 = {};
+            persistentTileZZ256.mComp.pFileName = "RayQueryPersistentTileZZ256.comp";
+            addShader(pRenderer, &persistentTileZZ256, &pShaderPersistentTileZZ256);
+
             ShaderLoadDesc persistentWave128 = {};
             persistentWave128.mComp.pFileName = "RayQueryPersistentWave128.comp";
             addShader(pRenderer, &persistentWave128, &pShaderPersistentWave128);
@@ -1975,6 +2053,9 @@ public:
             removeShader(pRenderer, pShaderWavefrontV2SecondaryB);
             removeShader(pRenderer, pShaderPersistentReset);
             removeShader(pRenderer, pShaderPersistentWave256);
+            removeShader(pRenderer, pShaderPersistentTile256);
+            removeShader(pRenderer, pShaderPersistentTileZLocal256);
+            removeShader(pRenderer, pShaderPersistentTileZZ256);
             removeShader(pRenderer, pShaderPersistentWave128);
             removeShader(pRenderer, pShaderPersistentWave64);
             removeShader(pRenderer, pShaderPersistentStatic256);
@@ -2025,6 +2106,9 @@ public:
             addExperimentalComputePipeline(pShaderWavefrontV2SecondaryB, &pPipelineWavefrontV2SecondaryB);
             addExperimentalComputePipeline(pShaderPersistentReset, &pPipelinePersistentReset);
             addExperimentalComputePipeline(pShaderPersistentWave256, &pPipelinePersistentWave256);
+            addExperimentalComputePipeline(pShaderPersistentTile256, &pPipelinePersistentTile256);
+            addExperimentalComputePipeline(pShaderPersistentTileZLocal256, &pPipelinePersistentTileZLocal256);
+            addExperimentalComputePipeline(pShaderPersistentTileZZ256, &pPipelinePersistentTileZZ256);
             addExperimentalComputePipeline(pShaderPersistentWave128, &pPipelinePersistentWave128);
             addExperimentalComputePipeline(pShaderPersistentWave64, &pPipelinePersistentWave64);
             addExperimentalComputePipeline(pShaderPersistentStatic256, &pPipelinePersistentStatic256);
@@ -2147,6 +2231,9 @@ public:
         removePipeline(pRenderer, pPipelineWavefrontV2SecondaryB);
         removePipeline(pRenderer, pPipelinePersistentReset);
         removePipeline(pRenderer, pPipelinePersistentWave256);
+        removePipeline(pRenderer, pPipelinePersistentTile256);
+        removePipeline(pRenderer, pPipelinePersistentTileZLocal256);
+        removePipeline(pRenderer, pPipelinePersistentTileZZ256);
         removePipeline(pRenderer, pPipelinePersistentWave128);
         removePipeline(pRenderer, pPipelinePersistentWave64);
         removePipeline(pRenderer, pPipelinePersistentStatic256);
@@ -2287,6 +2374,9 @@ private:
     Shader*                pShaderWavefrontV2SecondaryB = NULL;
     Shader*                pShaderPersistentReset = NULL;
     Shader*                pShaderPersistentWave256 = NULL;
+    Shader*                pShaderPersistentTile256 = NULL;
+    Shader*                pShaderPersistentTileZLocal256 = NULL;
+    Shader*                pShaderPersistentTileZZ256 = NULL;
     Shader*                pShaderPersistentWave128 = NULL;
     Shader*                pShaderPersistentWave64 = NULL;
     Shader*                pShaderPersistentStatic256 = NULL;
@@ -2315,6 +2405,9 @@ private:
     Pipeline*              pPipelineWavefrontV2SecondaryB = NULL;
     Pipeline*              pPipelinePersistentReset = NULL;
     Pipeline*              pPipelinePersistentWave256 = NULL;
+    Pipeline*              pPipelinePersistentTile256 = NULL;
+    Pipeline*              pPipelinePersistentTileZLocal256 = NULL;
+    Pipeline*              pPipelinePersistentTileZZ256 = NULL;
     Pipeline*              pPipelinePersistentWave128 = NULL;
     Pipeline*              pPipelinePersistentWave64 = NULL;
     Pipeline*              pPipelinePersistentStatic256 = NULL;
